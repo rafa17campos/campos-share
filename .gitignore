@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+
+# Internal plans
+plans/
+
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor files
+.vscode/
+.idea/
+next-env.d.ts
