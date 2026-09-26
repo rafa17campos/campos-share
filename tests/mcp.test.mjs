@@ -576,6 +576,57 @@ test('update_page replaces a page behind the same URL and keeps what it was not 
   await client.close();
 });
 
+test('update_page refuses an expired page until expires_at is given, and can set or clear it', async () => {
+  const storage = fresh();
+  await storage.putAsset('stale', '__page.html', '<p>v1</p>', 'text/html; charset=utf-8');
+  await storage.saveMeta('stale', {
+    slug: 'stale',
+    title: 'Stale',
+    lang: 'es',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    kind: 'uploaded',
+    assets: [],
+    expiresAt: '2026-02-01T00:00:00.000Z',
+    passwordHash: null,
+  });
+  const client = await connect(STATIC_TOKEN);
+  const page = async () => new Response((await storage.getAsset('stale', '__page.html')).stream).text();
+
+  const refused = await client.callTool({ name: 'update_page', arguments: { prefix: 'stale', html: '<p>v2</p>' } });
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0].text, /expires_at/);
+  assert.equal(await page(), '<p>v1</p>', 'a refused update writes nothing');
+
+  const unreadable = await client.callTool({
+    name: 'update_page',
+    arguments: { prefix: 'stale', html: '<p>v2</p>', expires_at: 'next tuesday' },
+  });
+  assert.equal(unreadable.isError, true);
+  assert.match(unreadable.content[0].text, /"expires_at" is not a date/);
+  assert.equal(await page(), '<p>v1</p>');
+
+  const extended = await client.callTool({
+    name: 'update_page',
+    arguments: { prefix: 'stale', html: '<p>v2</p>', expires_at: '2099-01-01T00:00:00Z' },
+  });
+  assert.equal(extended.isError, undefined, JSON.stringify(extended));
+  assert.equal(extended.structuredContent.expires_at, '2099-01-01T00:00:00.000Z');
+  assert.equal(await page(), '<p>v2</p>');
+
+  const kept = await client.callTool({ name: 'update_page', arguments: { prefix: 'stale', html: '<p>v3</p>' } });
+  assert.equal(kept.isError, undefined, JSON.stringify(kept));
+  assert.equal((await storage.getMeta('stale')).expiresAt, '2099-01-01T00:00:00.000Z', 'a future expiry stays');
+
+  const cleared = await client.callTool({
+    name: 'update_page',
+    arguments: { prefix: 'stale', html: '<p>v4</p>', expires_at: '' },
+  });
+  assert.equal(cleared.isError, undefined, JSON.stringify(cleared));
+  assert.equal(cleared.structuredContent.expires_at, undefined);
+  assert.equal((await storage.getMeta('stale')).expiresAt, null);
+  await client.close();
+});
+
 test('a page published through the tools is live at its URL and stays there when replaced', async () => {
   fresh();
   const client = await connect(STATIC_TOKEN);

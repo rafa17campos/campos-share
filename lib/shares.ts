@@ -276,8 +276,10 @@ export async function createShare(
 
 /**
  * Replaces the metadata and asset set of an existing share, pruning the blobs that are no longer
- * named. Fields absent from `body` for expiry and password keep their stored value. The record is
- * written before anything is pruned, so a write that loses the race deletes nothing.
+ * named. Fields absent from `body` for expiry and password keep their stored value. A share whose
+ * expiry has passed is refused unless `body` restates `expiresAt`: the expiry is an access control,
+ * so a replace never drops it unasked, and keeping it would republish content nobody can reach. The
+ * record is written before anything is pruned, so a write that loses the race deletes nothing.
  */
 export async function replaceShare(
   storage: StorageProvider,
@@ -288,6 +290,12 @@ export async function replaceShare(
   const result = await mutateShare(storage, slug, async (existing) => {
     const validated = await validateShareInput(slug, body, storage);
     if (isRejection(validated)) return validated;
+    if (validated.expiresAt === undefined && hasExpired(existing.expiresAt)) {
+      return {
+        error: `Share "${slug}" expired at ${existing.expiresAt}. Send "expiresAt" with a new date, or null to remove the expiry, to replace it.`,
+        status: 409,
+      };
+    }
 
     const keep = new Set(validated.assets.map((a) => a.name));
     obsolete = existing.assets.filter((a) => !keep.has(a.name)).map((a) => `${slug}/${a.name}`);

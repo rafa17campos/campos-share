@@ -565,6 +565,32 @@ test('Password Gate & Expiry Gate: Full Security Flow', async () => {
     { params: Promise.resolve({ slug: 'expired-share', filename: ['file.txt'] }) }
   );
   assert.equal(expAssetRes.status, 404);
+
+  // 8. Replacing an expired share without restating expiresAt is refused and changes nothing
+  const replaceExpired = (extra) =>
+    handleUpdateShare(
+      createApiRequest('https://share.example.invalid/api/shares/expired-share', 'PUT', {
+        title: 'Revived',
+        lang: 'es',
+        kind: 'generated',
+        assets: [{ name: 'file.txt', contentType: 'text/plain' }],
+        ...extra,
+      }),
+      { params: Promise.resolve({ slug: 'expired-share' }) }
+    );
+  const refusedRes = await replaceExpired({});
+  assert.equal(refusedRes.status, 409);
+  assert.match((await refusedRes.json()).error, /expiresAt/);
+  assert.equal((await storage.getMeta('expired-share')).title, 'Expired');
+
+  // 9. Restating it replaces the share; null serves it again with no expiry
+  const revivedPut = await replaceExpired({ expiresAt: null });
+  assert.equal(revivedPut.status, 200);
+  assert.equal((await revivedPut.json()).expiresAt, null);
+  const revivedRes = await handleViewShare(new Request('https://share.example.invalid/expired-share'), {
+    params: Promise.resolve({ slug: 'expired-share' }),
+  });
+  assert.equal(revivedRes.status, 200);
 });
 
 test('Orphan Sweep endpoint: POST /api/shares/orphans', async () => {

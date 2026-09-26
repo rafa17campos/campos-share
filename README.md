@@ -123,8 +123,9 @@ Retrieves full share record and asset URLs.
 
 ### 5. `PUT /api/shares/{slug}`
 Replaces metadata and asset set for an existing share, pruning obsolete blobs.
-* **Request**: Same payload as `POST /api/shares`. Assets uploaded beforehand via `POST /api/uploads`.
+* **Request**: Same payload as `POST /api/shares`. Assets uploaded beforehand via `POST /api/uploads`. Omitting `expiresAt` or `password` keeps the stored value.
 * **Response (`200 OK`)**: Updated share record.
+* **Response (`409 Conflict`)**: The share has expired and the request omits `expiresAt`. Send a new date, or `null` to remove the expiry; a replace never drops an expiry unasked.
 
 ### 6. `DELETE /api/shares/{slug}`
 Deletes `<slug>/__meta.json` and all associated blobs under `<slug>/`.
@@ -177,7 +178,7 @@ A **page** is the other kind of share (`kind: "uploaded"`): one HTML document se
 | `create_upload_url` | Returns a presigned `PUT` URL (15 min, bound to content type and size) for files up to **20 MB**, plus the URL the file will have. For large files and for clients that can run `curl`. `overwrite: true` replaces an existing file in place. | `files:write` | writes |
 | `complete_upload` | Publishes a file uploaded through `create_upload_url`, or refreshes its record after an overwrite. Idempotent. | `files:write` | idempotent |
 | `publish_page` | Publishes an HTML document (inline, up to **3 MB**) as a page at `$SHARE_BASE_URL/<prefix>`. Never overwrites. | `files:write` | writes |
-| `update_page` | Replaces the document of an existing page and keeps its URL. Title, description and language keep their stored value unless restated. | `files:write` | **destructive**, idempotent |
+| `update_page` | Replaces the document of an existing page and keeps its URL. Title, description, language and expiry (`expires_at`, empty string to remove) keep their stored value unless restated; an expired page is refused until `expires_at` is given. | `files:write` | **destructive**, idempotent |
 | `list_files` | Name, size, date and URL of every file, optionally under a prefix, 50 per page with a cursor, plus every page matching the prefix (not paginated). | `files:read` | read-only |
 | `get_file_info` | Details of one file, one folder or one page. | `files:read` | read-only |
 | `delete_file` | Deletes a file, a whole folder, or a page (by its prefix). Deleting the last file deletes its folder. | `files:delete` | **destructive** |

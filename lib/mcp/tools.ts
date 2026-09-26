@@ -17,6 +17,7 @@ import {
   assetUrl,
   createShare,
   deleteShare,
+  hasExpired,
   isRejection,
   isValidAssetName,
   isValidSlug,
@@ -712,6 +713,13 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             .optional()
             .describe('New description; an empty string removes the one it has. Defaults to the one the page already has.'),
           lang: z.string().max(20).optional().describe('New content language. Defaults to the one the page already has.'),
+          expires_at: z
+            .string()
+            .optional()
+            .describe(
+              'When the page stops being served, ISO 8601; an empty string removes the expiry. Defaults to the one the ' +
+                'page already has. Required when the page has already expired.'
+            ),
         })
       ),
       outputSchema: lcd(
@@ -723,6 +731,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           size_bytes: z.number().int().describe('Size of the new document in bytes.'),
           previous_size_bytes: z.number().int().describe('Size of the document that was replaced.'),
           updated_at: z.string().describe('When the replacement happened, ISO 8601.'),
+          expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
         })
       ),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -747,6 +756,17 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         );
       }
 
+      const expiresAt = args.expires_at?.trim();
+      if (expiresAt && Number.isNaN(new Date(expiresAt).getTime())) {
+        return fail(`"expires_at" is not a date this can read: "${expiresAt}". Use ISO 8601, or an empty string to remove the expiry.`);
+      }
+      if (expiresAt === undefined && hasExpired(meta.expiresAt)) {
+        return fail(
+          `The page "${prefix}" expired at ${meta.expiresAt} and is no longer served. Call update_page again with ` +
+            '"expires_at": a new ISO 8601 date to serve it until then, or an empty string to serve it with no expiry.'
+        );
+      }
+
       const before = await storage.headAsset(prefix, PAGE_ASSET_NAME);
       const result = await replaceShare(storage, prefix, {
         title: args.title?.trim() || meta.title,
@@ -754,6 +774,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         lang: args.lang?.trim() || meta.lang,
         kind: 'uploaded',
         html,
+        ...(expiresAt !== undefined ? { expiresAt } : {}),
       });
       if (isRejection(result)) return failRejection(result);
 
@@ -767,6 +788,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         size_bytes: size,
         previous_size_bytes: previous,
         updated_at: new Date().toISOString(),
+        expires_at: result.meta.expiresAt ?? undefined,
       };
       return ok(
         `Updated the page "${structured.title}": ${formatBytes(previous)} -> ${formatBytes(size)} of HTML. The URL is unchanged: ${structured.url}`,
