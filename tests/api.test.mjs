@@ -640,8 +640,7 @@ test('Canonical URLs are immune to Host header spoofing', async () => {
   });
   const createRes = await handleCreateShare(createReq);
   const createJson = await createRes.json();
-  assert.ok(createJson.url.startsWith('https://share.example.invalid/'));
-  assert.ok(!createJson.url.includes('evil-attacker.com'));
+  assert.equal(new URL(createJson.url).origin, 'https://share.example.invalid');
 });
 
 test('Each declared file gets its own URL bound to its own pathname', async () => {
