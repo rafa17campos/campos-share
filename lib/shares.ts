@@ -10,6 +10,7 @@
  */
 
 import {
+  AssetConflictError,
   MetaConflictError,
   isReservedAssetName,
   type ShareAsset,
@@ -198,13 +199,53 @@ export async function issueUploadUrls(
   return storage.createUploadTokens(slug, files);
 }
 
-export type ShareWriteResult = { meta: ShareMeta; created: boolean };
+export type ShareWriteResult = {
+  meta: ShareMeta;
+  created: boolean;
+  /** For a replaced page, the version of the document just written, from `contentVersion`. */
+  pageVersion?: string;
+};
 
 type AssetAddition = { name: string; originalName?: string; contentType: string; sha256?: string };
 
 export function sha256Hex(data: Buffer | Uint8Array | string): string {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
+
+/**
+ * The version of a stored file as callers see it: the store's ETag without quotes or weak marker,
+ * so a model that copies it by hand cannot get it wrong. Two reads return the same version exactly
+ * when the bytes did not change in between.
+ */
+export function contentVersion(etag: string): string {
+  return etag.replace(/^W\//, '').replace(/^"|"$/g, '');
+}
+
+function staleVersion(slug: string, name: string, version: string): ShareInputRejection {
+  const what = name === PAGE_ASSET_NAME ? `The page "${slug}"` : `"${slug}/${name}"`;
+  return { error: `${what} changed since version ${version} was read; nothing was written`, status: 412 };
+}
+
+/**
+ * The store's ETag of a file if it is still at `version`, or the rejection that says it is not.
+ * The ETag goes to `putAsset` as `ifMatch`, so a write that lands between this check and the put
+ * is caught by the store as well.
+ */
+async function currentEtagAt(
+  storage: StorageProvider,
+  slug: string,
+  name: string,
+  version: string
+): Promise<string | ShareInputRejection> {
+  const head = await storage.headAsset(slug, name);
+  if (!head || !head.exists || contentVersion(head.etag) !== contentVersion(version)) {
+    return staleVersion(slug, name, version);
+  }
+  return head.etag;
+}
+
+/** Only write if the content is still at this version, from `contentVersion`; omit to overwrite unconditionally. */
+export type ContentWriteOptions = { ifVersion?: string };
 
 const MUTATION_ATTEMPTS = 5;
 
@@ -284,9 +325,12 @@ export async function createShare(
 export async function replaceShare(
   storage: StorageProvider,
   slug: string,
-  body: ShareInputBody
+  body: ShareInputBody,
+  options: ContentWriteOptions = {}
 ): Promise<ShareWriteResult | ShareInputRejection> {
   let obsolete: string[] = [];
+  // Our own page write, so a retry after a record conflict is conditional on it, not on the version read.
+  let pageWritten: string | undefined;
   const result = await mutateShare(storage, slug, async (existing) => {
     const validated = await validateShareInput(slug, body, storage);
     if (isRejection(validated)) return validated;
@@ -304,7 +348,23 @@ export async function replaceShare(
     }
 
     if (validated.kind === 'uploaded' && validated.html) {
-      await storage.putAsset(slug, PAGE_ASSET_NAME, validated.html, 'text/html; charset=utf-8');
+      let ifMatch: string | undefined;
+      if (options.ifVersion !== undefined) {
+        if (pageWritten !== undefined) {
+          ifMatch = pageWritten;
+        } else {
+          const current = await currentEtagAt(storage, slug, PAGE_ASSET_NAME, options.ifVersion);
+          if (typeof current !== 'string') return current;
+          ifMatch = current;
+        }
+      }
+      try {
+        const written = await storage.putAsset(slug, PAGE_ASSET_NAME, validated.html, 'text/html; charset=utf-8', { ifMatch });
+        pageWritten = written.etag;
+      } catch (err) {
+        if (err instanceof AssetConflictError) return staleVersion(slug, PAGE_ASSET_NAME, options.ifVersion ?? '');
+        throw err;
+      }
     }
 
     let passwordHash = existing.passwordHash;
@@ -328,7 +388,7 @@ export async function replaceShare(
   if (obsolete.length > 0) {
     await storage.deleteBlobs(obsolete);
   }
-  return result;
+  return pageWritten === undefined ? result : { ...result, pageVersion: contentVersion(pageWritten) };
 }
 
 function notAFolder(slug: string): ShareInputRejection {
@@ -414,14 +474,27 @@ export async function replaceAssetContent(
   slug: string,
   name: string,
   data: Buffer | Uint8Array | string,
-  contentType: string
+  contentType: string,
+  options: ContentWriteOptions = {}
 ): Promise<ShareWriteResult | ShareInputRejection> {
   const before = await storage.getMeta(slug);
   if (!before) return { error: 'Not Found', status: 404 };
   if (before.kind !== 'generated') return notAFolder(slug);
   if (!before.assets.some((a) => a.name === name)) return noSuchFile(slug, name);
 
-  const written = await storage.putAsset(slug, name, data, contentType);
+  let ifMatch: string | undefined;
+  if (options.ifVersion !== undefined) {
+    const current = await currentEtagAt(storage, slug, name, options.ifVersion);
+    if (typeof current !== 'string') return current;
+    ifMatch = current;
+  }
+  let written: { size: number; etag: string };
+  try {
+    written = await storage.putAsset(slug, name, data, contentType, { ifMatch });
+  } catch (err) {
+    if (err instanceof AssetConflictError) return staleVersion(slug, name, options.ifVersion ?? '');
+    throw err;
+  }
   const sha256 = sha256Hex(data);
   const updatedAt = new Date().toISOString();
   return mutateShare(storage, slug, async (meta) => {

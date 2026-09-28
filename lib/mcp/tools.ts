@@ -4,8 +4,9 @@
  * The tools the MCP endpoint offers, on top of the share operations in lib/shares.ts. The model
  * they present is a flat one: a *folder* is a share (its slug is the `prefix`), a *file* is an
  * asset in it, and a `path` is `<prefix>/<filename>`. Every tool returns readable text and the
- * same data as `structuredContent`, and every failure is a tool result with `isError`, never an
- * exception, so the model can read what went wrong and try again.
+ * same data as `structuredContent` (read_file keeps the content itself to the text), and every
+ * failure is a tool result with `isError`, never an exception, so the model can read what went
+ * wrong and try again.
  */
 
 import crypto from 'node:crypto';
@@ -15,6 +16,7 @@ import type { ShareMeta, StorageProvider } from '../storage.ts';
 import {
   appendAssets,
   assetUrl,
+  contentVersion,
   createShare,
   deleteShare,
   hasExpired,
@@ -53,7 +55,32 @@ function fail(message: string): CallToolResult {
 }
 
 function failRejection(rejection: ShareInputRejection): CallToolResult {
+  if (rejection.status === 412) {
+    return fail(
+      `${rejection.error}. Someone changed it after you read it: call read_file again and apply your change to the current content.`
+    );
+  }
   return fail(rejection.error);
+}
+
+const versionInput = z
+  .string()
+  .max(200)
+  .optional()
+  .describe(
+    'The "version" read_file returned for the content you edited. When given, nothing is written if the content ' +
+      'changed since then; omit it to overwrite whatever is there.'
+  );
+
+/** Content types whose bytes read_file returns as text when they are valid UTF-8. */
+function isTextType(contentType: string): boolean {
+  const type = contentType.split(';')[0].trim().toLowerCase();
+  return (
+    type.startsWith('text/') ||
+    /^application\/(json|xml|javascript|ecmascript|x-javascript|x-sh|x-yaml|yaml|toml|sql|graphql|ld\+json|manifest\+json)$/.test(type) ||
+    type.endsWith('+json') ||
+    type.endsWith('+xml')
+  );
 }
 
 function scopesOf(ctx: ToolContext): string[] {
@@ -338,7 +365,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         'Replace the content of an existing file, keeping its URL. Send the whole new content inline, ' +
         `encoding "text" or "base64", at most ${MAX_INLINE_BYTES / (1024 * 1024)} MB decoded; for larger files use ` +
         'create_upload_url with "overwrite": true and then complete_upload. The previous content is lost. ' +
-        'To publish a file that does not exist yet, use upload_file instead.',
+        'To edit what is there, read it first with read_file and pass the "version" it returns, so a change made ' +
+        'in between is not overwritten. To publish a file that does not exist yet, use upload_file instead.',
       inputSchema: lcd(
         z.object({
           path: z.string().min(3).max(340).describe('The file to replace, "<prefix>/<filename>".'),
@@ -351,6 +379,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             .max(200)
             .optional()
             .describe('New MIME type to serve the file with. Defaults to the type it already has.'),
+          version: versionInput,
         })
       ),
       outputSchema: lcd(
@@ -362,6 +391,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           previous_size_bytes: z.number().int().describe('Size of the content that was replaced.'),
           content_type: z.string().describe('MIME type the file is served with.'),
           updated_at: z.string().describe('When the replacement happened, ISO 8601.'),
+          version: z.string().describe('Version of the new content; pass it to the next update_file to chain edits without reading again.'),
         })
       ),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -391,7 +421,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       if (!Buffer.isBuffer(bytes)) return bytes;
       const contentType = args.content_type?.trim() || current.contentType;
 
-      const result = await replaceAssetContent(storage, prefix, filename, bytes, contentType);
+      const result = await replaceAssetContent(storage, prefix, filename, bytes, contentType, { ifVersion: args.version?.trim() || undefined });
       if (isRejection(result)) return failRejection(result);
       const stored = result.meta.assets.find((a) => a.name === filename);
 
@@ -403,9 +433,10 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         previous_size_bytes: current.sizeBytes,
         content_type: contentType,
         updated_at: stored?.updatedAt ?? new Date().toISOString(),
+        version: stored?.etag ? contentVersion(stored.etag) : '',
       };
       return ok(
-        `Updated ${structured.path}: ${formatBytes(current.sizeBytes)} -> ${formatBytes(bytes.length)}, ${contentType}. The URL is unchanged: ${structured.url}`,
+        `Updated ${structured.path}: ${formatBytes(current.sizeBytes)} -> ${formatBytes(bytes.length)}, ${contentType}, version ${structured.version}. The URL is unchanged: ${structured.url}`,
         structured
       );
     }
@@ -700,8 +731,10 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       description:
         'Replace the content of a published page, keeping its URL. Send the complete new document inline as ' +
         `UTF-8 text, at most ${MAX_INLINE_BYTES / (1024 * 1024)} MB; the previous content is lost. Title, ` +
-        'description and language keep their stored value unless you pass a new one. To publish a page that does ' +
-        'not exist yet use publish_page, and to change one file inside a folder use update_file.',
+        'description and language keep their stored value unless you pass a new one. To edit the page, read its ' +
+        'current HTML with read_file, change it, and send it back with the "version" read_file returned, so a ' +
+        'change made in between is not overwritten. To publish a page that does not exist yet use publish_page, ' +
+        'and to change one file inside a folder use update_file.',
       inputSchema: lcd(
         z.object({
           prefix: z.string().min(1).max(80).describe('The page to replace, the name it is published under.'),
@@ -720,6 +753,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
               'When the page stops being served, ISO 8601; an empty string removes the expiry. Defaults to the one the ' +
                 'page already has. Required when the page has already expired.'
             ),
+          version: versionInput,
         })
       ),
       outputSchema: lcd(
@@ -732,6 +766,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           previous_size_bytes: z.number().int().describe('Size of the document that was replaced.'),
           updated_at: z.string().describe('When the replacement happened, ISO 8601.'),
           expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
+          version: z.string().describe('Version of the new document; pass it to the next update_page to chain edits without reading again.'),
         })
       ),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -775,7 +810,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         kind: 'uploaded',
         html,
         ...(expiresAt !== undefined ? { expiresAt } : {}),
-      });
+      }, { ifVersion: args.version?.trim() || undefined });
       if (isRejection(result)) return failRejection(result);
 
       const size = Buffer.byteLength(html, 'utf8');
@@ -789,9 +824,10 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         previous_size_bytes: previous,
         updated_at: new Date().toISOString(),
         expires_at: result.meta.expiresAt ?? undefined,
+        version: result.pageVersion ?? '',
       };
       return ok(
-        `Updated the page "${structured.title}": ${formatBytes(previous)} -> ${formatBytes(size)} of HTML. The URL is unchanged: ${structured.url}`,
+        `Updated the page "${structured.title}": ${formatBytes(previous)} -> ${formatBytes(size)} of HTML, version ${structured.version}. The URL is unchanged: ${structured.url}`,
         structured
       );
     }
@@ -1013,6 +1049,117 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           (items.length ? `\n${items.map(describeFile).join('\n')}` : ''),
         structured
       );
+    }
+  );
+
+  /* ------------------------------------------------------------------- read_file --------- */
+  server.registerTool(
+    'read_file',
+    {
+      title: 'Read a file or page',
+      description:
+        'Return the current content of one file ("<prefix>/<filename>") or the HTML of one published page ' +
+        '("<prefix>"), read straight from storage, so it works for password-protected and expired content and ' +
+        'without network access to the public URL. Text comes back as UTF-8, anything else as base64, up to ' +
+        `${MAX_INLINE_BYTES / (1024 * 1024)} MB. Read before editing: change the content and send it back with ` +
+        'update_page or update_file together with the "version" returned here.',
+      inputSchema: lcd(
+        z.object({
+          path: z.string().min(1).max(340).describe('A file path "<prefix>/<filename>", or a page name "<prefix>".'),
+        })
+      ),
+      outputSchema: lcd(
+        z.object({
+          path: z.string().describe('The path that was read.'),
+          type: z.enum(['file', 'page']).describe('Whether the path is a file in a folder or a published HTML page.'),
+          encoding: z.enum(['text', 'base64']).describe('"text" for UTF-8 text, "base64" for binary content.'),
+          content_type: z.string().describe('The MIME type the content is served with.'),
+          size_bytes: z.number().int().describe('Size of the content in bytes.'),
+          version: z
+            .string()
+            .describe('Version of this content. Pass it as "version" to update_page or update_file so they refuse to overwrite a newer change.'),
+          url: z.string().describe('Public URL of the file or page.'),
+        })
+      ),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args, ctx) => {
+      const denied = requireScope(ctx as ToolContext, SCOPE_READ);
+      if (denied) return denied;
+      const parsed = parsePath(args.path);
+      if ('content' in parsed) return parsed;
+      const { prefix, filename } = parsed;
+
+      const meta = await storage.getMeta(prefix);
+      if (!meta) return fail(`Nothing is published under "${prefix}".`);
+
+      let blobName: string;
+      if (filename === null) {
+        if (meta.kind !== 'uploaded') {
+          const names = meta.assets.map((a) => `${prefix}/${a.name}`).join(', ') || '(none)';
+          return fail(`"${prefix}" is a folder of files, not a page. Read one of its files by path: ${names}.`);
+        }
+        blobName = PAGE_ASSET_NAME;
+      } else {
+        if (meta.kind !== 'generated') {
+          return fail(`"${prefix}" is a published page, not a folder, so it holds no files. Read its HTML with path "${prefix}".`);
+        }
+        if (!meta.assets.some((a) => a.name === filename)) {
+          const names = meta.assets.map((a) => a.name).join(', ') || '(none)';
+          return fail(`"${prefix}" has no file named "${filename}". Files in it: ${names}.`);
+        }
+        blobName = filename;
+      }
+
+      const url = filename === null ? shareUrl(prefix) : assetUrl(prefix, filename);
+      const head = await storage.headAsset(prefix, blobName);
+      if (!head || !head.exists) return fail(`The content of "${args.path.trim()}" is missing from storage.`);
+      if (head.size > MAX_INLINE_BYTES) {
+        return fail(
+          `"${args.path.trim()}" is ${formatBytes(head.size)}, above the ${MAX_INLINE_BYTES / (1024 * 1024)} MB that fits in one ` +
+            `tool result. Download it from ${url} instead.`
+        );
+      }
+      const read = await storage.getAsset(prefix, blobName);
+      if (!read || !read.stream) return fail(`The content of "${args.path.trim()}" is missing from storage.`);
+      const bytes = Buffer.from(await new Response(read.stream).arrayBuffer());
+
+      const contentType = filename === null ? 'text/html; charset=utf-8' : read.contentType;
+      let content: string | null = null;
+      if (isTextType(contentType)) {
+        try {
+          content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+        } catch {
+          content = null;
+        }
+      }
+      const encoding = content === null ? ('base64' as const) : ('text' as const);
+      const body = content ?? bytes.toString('base64');
+      const structured = {
+        path: filename === null ? prefix : `${prefix}/${filename}`,
+        type: filename === null ? ('page' as const) : ('file' as const),
+        encoding,
+        content_type: contentType,
+        size_bytes: bytes.length,
+        version: contentVersion(read.etag),
+        url,
+      };
+      const next = filename === null ? 'update_page' : 'update_file';
+      // The content goes out once, in its own text block, and not again in structuredContent: a copy in
+      // each would double the response, and Vercel cuts function responses at 4.5 MB.
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              `${structured.path}: ${formatBytes(bytes.length)}, ${contentType}, ${encoding === 'text' ? 'UTF-8 text' : 'base64'}, ` +
+              `version ${structured.version}. URL: ${url}\nTo change it, send the whole new content to ${next} with ` +
+              `"version": "${structured.version}". The content follows in the next block.`,
+          },
+          { type: 'text', text: body },
+        ],
+        structuredContent: structured,
+      };
     }
   );
 

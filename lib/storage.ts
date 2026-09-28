@@ -126,6 +126,19 @@ export class MetaConflictError extends Error {
   }
 }
 
+/** Thrown by `putAsset` when `ifMatch` names a version of the file that is no longer current. */
+export class AssetConflictError extends Error {
+  constructor(slug: string, filename: string) {
+    super(`"${slug}/${filename}" changed since it was read`);
+    this.name = 'AssetConflictError';
+  }
+}
+
+export interface PutAssetOptions {
+  /** Write only if the file still carries this ETag; otherwise throw `AssetConflictError`. */
+  ifMatch?: string;
+}
+
 export interface MetaRead {
   meta: ShareMeta;
   /** The store's ETag of the record as read; hand it back to `saveMeta` as `ifMatch`. */
@@ -141,7 +154,13 @@ export interface StorageProvider {
   getMeta(slug: string): Promise<ShareMeta | null>;
   readMeta(slug: string): Promise<MetaRead | null>;
   saveMeta(slug: string, meta: ShareMeta, options?: SaveMetaOptions): Promise<void>;
-  putAsset(slug: string, filename: string, data: Buffer | Uint8Array | string, contentType: string): Promise<{ url: string; size: number; etag: string }>;
+  putAsset(
+    slug: string,
+    filename: string,
+    data: Buffer | Uint8Array | string,
+    contentType: string,
+    options?: PutAssetOptions
+  ): Promise<{ url: string; size: number; etag: string }>;
   getAsset(slug: string, filename: string, options?: { ifNoneMatch?: string }): Promise<AssetRead | null>;
   headAsset(slug: string, filename: string): Promise<AssetHead | null>;
   createUploadTokens(slug: string, files: UploadRequestFile[]): Promise<UploadTokensResult>;
@@ -212,18 +231,28 @@ export class VercelBlobStorage implements StorageProvider {
     slug: string,
     filename: string,
     data: Buffer | Uint8Array | string,
-    contentType: string
+    contentType: string,
+    options: PutAssetOptions = {}
   ): Promise<{ url: string; size: number; etag: string }> {
     const assetPath = `${slug}/${filename}`;
     const body = typeof data === 'string' ? data : Buffer.from(data);
-    const result = await put(assetPath, body, {
-      access: BLOB_ACCESS,
-      contentType,
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      cacheControlMaxAge: BLOB_CACHE_MAX_AGE_SECONDS,
-      token: this.token,
-    });
+    let result;
+    try {
+      result = await put(assetPath, body, {
+        access: BLOB_ACCESS,
+        contentType,
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        cacheControlMaxAge: BLOB_CACHE_MAX_AGE_SECONDS,
+        token: this.token,
+        ...(options.ifMatch ? { ifMatch: options.ifMatch } : {}),
+      });
+    } catch (err: unknown) {
+      if (err instanceof BlobPreconditionFailedError || (err as { name?: string })?.name === 'BlobPreconditionFailedError') {
+        throw new AssetConflictError(slug, filename);
+      }
+      throw err;
+    }
     const size = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.length;
     return { url: result.url, size, etag: result.etag };
   }
@@ -485,8 +514,13 @@ export class MemoryStorage implements StorageProvider {
     slug: string,
     filename: string,
     data: Buffer | Uint8Array | string,
-    contentType: string
+    contentType: string,
+    options: PutAssetOptions = {}
   ): Promise<{ url: string; size: number; etag: string }> {
+    if (options.ifMatch) {
+      const current = this.blobs.get(`${slug}/${filename}`);
+      if (!current || memoryEtag(current.data) !== options.ifMatch) throw new AssetConflictError(slug, filename);
+    }
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
     this.blobs.set(`${slug}/${filename}`, {
       data: bytes,

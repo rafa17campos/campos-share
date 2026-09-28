@@ -85,7 +85,7 @@ function walk(node, visit, path = '') {
   }
 }
 
-test('tools/list advertises the nine tools with least-common-denominator schemas and annotations', async () => {
+test('tools/list advertises the ten tools with least-common-denominator schemas and annotations', async () => {
   fresh();
   const client = await connect(STATIC_TOKEN);
   const { tools } = await client.listTools();
@@ -100,6 +100,7 @@ test('tools/list advertises the nine tools with least-common-denominator schemas
       'get_file_info',
       'list_files',
       'publish_page',
+      'read_file',
       'update_file',
       'update_page',
       'upload_file',
@@ -840,6 +841,121 @@ test('get_file_info describes a file, a folder or a page and fails clearly when 
 
   const missingFolder = await client.callTool({ name: 'get_file_info', arguments: { path: 'nothing-here' } });
   assert.equal(missingFolder.isError, true);
+  await client.close();
+});
+
+test('read_file returns a page or a file from storage, with a version, and refuses what it cannot return', async () => {
+  const storage = fresh();
+  const html = '<!DOCTYPE html><html><body><p>Menú del día: ñoquis</p></body></html>';
+  await storage.putAsset('landing', '__page.html', html, 'text/html; charset=utf-8');
+  await storage.saveMeta('landing', {
+    slug: 'landing',
+    title: 'Landing',
+    lang: 'es',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    kind: 'uploaded',
+    assets: [],
+    expiresAt: '2020-01-01T00:00:00.000Z',
+    passwordHash: 'scrypt$whatever',
+  });
+  await seedFolder(storage, 'notes', [['readme.md', '# Título', 'text/markdown; charset=utf-8'], ['logo.png', '\x89PNG\r\n\x1a\n\xff', 'image/png']]);
+  const client = await connect(STATIC_TOKEN);
+
+  const page = await client.callTool({ name: 'read_file', arguments: { path: 'landing' } });
+  assert.equal(page.isError, undefined, JSON.stringify(page));
+  assert.equal(page.content[1].text, html, 'an expired, password-protected page is still readable by its owner');
+  assert.equal(page.structuredContent.type, 'page');
+  assert.equal(page.structuredContent.encoding, 'text');
+  assert.equal(page.structuredContent.size_bytes, Buffer.byteLength(html));
+  assert.equal(page.structuredContent.url, 'https://share.example.invalid/landing');
+  assert.equal(page.structuredContent.content, undefined, 'the content is not sent twice');
+  assert.match(page.structuredContent.version, /^[^"]+$/);
+  assert.match(page.content[0].text, /update_page/);
+
+  const md = await client.callTool({ name: 'read_file', arguments: { path: 'notes/readme.md' } });
+  assert.equal(md.content[1].text, '# Título');
+  assert.equal(md.structuredContent.encoding, 'text');
+
+  await storage.putAsset('notes', 'datos.csv', '\uFEFFnombre;año\nÑoño;2026', 'text/csv; charset=utf-8');
+  const meta0 = await storage.getMeta('notes');
+  meta0.assets.push({ name: 'datos.csv', originalName: 'datos.csv', contentType: 'text/csv; charset=utf-8', sizeBytes: 25 });
+  await storage.saveMeta('notes', meta0);
+  const csv = await client.callTool({ name: 'read_file', arguments: { path: 'notes/datos.csv' } });
+  assert.equal(csv.content[1].text, '\uFEFFnombre;año\nÑoño;2026', 'a byte-order mark survives a read and write round trip');
+
+  const png = await client.callTool({ name: 'read_file', arguments: { path: 'notes/logo.png' } });
+  assert.equal(png.structuredContent.encoding, 'base64');
+  assert.deepEqual(Buffer.from(png.content[1].text, 'base64'), Buffer.from('\x89PNG\r\n\x1a\n\xff'));
+
+  const folder = await client.callTool({ name: 'read_file', arguments: { path: 'notes' } });
+  assert.equal(folder.isError, true);
+  assert.match(folder.content[0].text, /notes\/readme\.md/);
+
+  const inPage = await client.callTool({ name: 'read_file', arguments: { path: 'landing/x.html' } });
+  assert.equal(inPage.isError, true);
+  assert.match(inPage.content[0].text, /path "landing"/);
+
+  const reserved = await client.callTool({ name: 'read_file', arguments: { path: 'landing/__page.html' } });
+  assert.equal(reserved.isError, true);
+  const meta = await client.callTool({ name: 'read_file', arguments: { path: 'landing/__meta.json' } });
+  assert.equal(meta.isError, true, 'the record, password hash included, is never readable');
+
+  await storage.putAsset('big', 'huge.txt', 'x'.repeat(3 * 1024 * 1024 + 1), 'text/plain');
+  await storage.saveMeta('big', {
+    slug: 'big', title: 'Big', lang: 'es', createdAt: '2026-01-01T00:00:00.000Z', kind: 'generated',
+    assets: [{ name: 'huge.txt', originalName: 'huge.txt', contentType: 'text/plain', sizeBytes: 3 * 1024 * 1024 + 1 }],
+  });
+  const tooBig = await client.callTool({ name: 'read_file', arguments: { path: 'big/huge.txt' } });
+  assert.equal(tooBig.isError, true);
+  assert.match(tooBig.content[0].text, /https:\/\/share\.example\.invalid\/big\/huge\.txt/);
+
+  const missing = await client.callTool({ name: 'read_file', arguments: { path: 'nothing' } });
+  assert.equal(missing.isError, true);
+  await client.close();
+});
+
+test('update_page and update_file with a version refuse to overwrite a newer change', async () => {
+  const storage = fresh();
+  await storage.putAsset('landing', '__page.html', '<p>v1</p>', 'text/html; charset=utf-8');
+  await storage.saveMeta('landing', {
+    slug: 'landing', title: 'Landing', lang: 'es', createdAt: '2026-01-01T00:00:00.000Z',
+    kind: 'uploaded', assets: [], expiresAt: null, passwordHash: null,
+  });
+  await seedFolder(storage, 'notes', [['a.md', '# a', 'text/markdown']]);
+  const client = await connect(STATIC_TOKEN);
+
+  const read = await client.callTool({ name: 'read_file', arguments: { path: 'landing' } });
+  const v1 = read.structuredContent.version;
+
+  const first = await client.callTool({ name: 'update_page', arguments: { prefix: 'landing', html: '<p>v2</p>', version: v1 } });
+  assert.equal(first.isError, undefined, JSON.stringify(first));
+  const v2 = first.structuredContent.version;
+  assert.notEqual(v2, v1);
+
+  const stale = await client.callTool({ name: 'update_page', arguments: { prefix: 'landing', html: '<p>otra</p>', version: v1 } });
+  assert.equal(stale.isError, true);
+  assert.match(stale.content[0].text, /read_file/);
+  assert.equal(await new Response((await storage.getAsset('landing', '__page.html')).stream).text(), '<p>v2</p>', 'nothing changed');
+
+  const quoted = await client.callTool({ name: 'update_page', arguments: { prefix: 'landing', html: '<p>v3</p>', version: `"${v2}"` } });
+  assert.equal(quoted.isError, undefined, 'a version copied with its quotes still matches');
+
+  const blind = await client.callTool({ name: 'update_page', arguments: { prefix: 'landing', html: '<p>v4</p>' } });
+  assert.equal(blind.isError, undefined, 'without a version the page is overwritten as before');
+  assert.equal((await client.callTool({ name: 'read_file', arguments: { path: 'landing' } })).structuredContent.version, blind.structuredContent.version);
+
+  const f1 = (await client.callTool({ name: 'read_file', arguments: { path: 'notes/a.md' } })).structuredContent.version;
+  const fileOk = await client.callTool({ name: 'update_file', arguments: { path: 'notes/a.md', content: '# b', encoding: 'text', version: f1 } });
+  assert.equal(fileOk.isError, undefined, JSON.stringify(fileOk));
+  const fileStale = await client.callTool({ name: 'update_file', arguments: { path: 'notes/a.md', content: '# c', encoding: 'text', version: f1 } });
+  assert.equal(fileStale.isError, true);
+  assert.match(fileStale.content[0].text, /read_file/);
+  const chained = await client.callTool({
+    name: 'update_file',
+    arguments: { path: 'notes/a.md', content: '# d', encoding: 'text', version: fileOk.structuredContent.version },
+  });
+  assert.equal(chained.isError, undefined, 'the version an update returns chains into the next one');
+  assert.equal(await new Response((await storage.getAsset('notes', 'a.md')).stream).text(), '# d');
   await client.close();
 });
 

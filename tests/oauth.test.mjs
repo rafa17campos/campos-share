@@ -273,7 +273,7 @@ test('full flow: discovery, DCR, login with the passphrase, PKCE token exchange,
 
   const mcp = await connectMcp(tokens.body.access_token);
   const { tools } = await mcp.listTools();
-  assert.equal(tools.length, 9);
+  assert.equal(tools.length, 10);
   const upload = await mcp.callTool({ name: 'upload_file', arguments: { filename: 'hola.txt', content: 'hola', encoding: 'text' } });
   assert.equal(upload.isError, undefined, JSON.stringify(upload));
   const del = await mcp.callTool({ name: 'delete_file', arguments: { path: upload.structuredContent.prefix } });

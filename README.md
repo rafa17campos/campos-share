@@ -169,25 +169,28 @@ Nothing in it is specific to one vendor: no UI widgets, no vendor `_meta`, only 
 
 A **folder** is a share and its slug is the `prefix`. A **file** is an asset in it. A **path** is `<prefix>/<filename>`. Every file is public at `$SHARE_BASE_URL/<prefix>/<filename>` and its folder page at `$SHARE_BASE_URL/<prefix>`.
 
-A **page** is the other kind of share (`kind: "uploaded"`): one HTML document served at `$SHARE_BASE_URL/<prefix>` with nothing around it. A page holds no files, so the file tools refuse it and say so; `publish_page` and `update_page` are its two verbs.
+A **page** is the other kind of share (`kind: "uploaded"`): one HTML document served at `$SHARE_BASE_URL/<prefix>` with nothing around it. A page holds no files, so the file tools refuse it and say so; `publish_page` and `update_page` are its two verbs, and `read_file` with the page name returns its HTML.
 
 | Tool | Does | Scope | Annotations |
 |---|---|---|---|
 | `upload_file` | Publishes inline content (`text` or `base64`, up to **3 MB** decoded) and returns the public URL. Creates the folder or adds to an existing one. Never overwrites. | `files:write` | writes |
-| `update_file` | Replaces the content of an existing file (inline, up to **3 MB** decoded) and keeps its URL. | `files:write` | **destructive**, idempotent |
+| `update_file` | Replaces the content of an existing file (inline, up to **3 MB** decoded) and keeps its URL. With the `version` from `read_file` it refuses to overwrite a change made since that read. | `files:write` | **destructive**, idempotent |
 | `create_upload_url` | Returns a presigned `PUT` URL (15 min, bound to content type and size) for files up to **20 MB**, plus the URL the file will have. For large files and for clients that can run `curl`. `overwrite: true` replaces an existing file in place. | `files:write` | writes |
 | `complete_upload` | Publishes a file uploaded through `create_upload_url`, or refreshes its record after an overwrite. Idempotent. | `files:write` | idempotent |
 | `publish_page` | Publishes an HTML document (inline, up to **3 MB**) as a page at `$SHARE_BASE_URL/<prefix>`. Never overwrites. | `files:write` | writes |
-| `update_page` | Replaces the document of an existing page and keeps its URL. Title, description, language and expiry (`expires_at`, empty string to remove) keep their stored value unless restated; an expired page is refused until `expires_at` is given. | `files:write` | **destructive**, idempotent |
+| `update_page` | Replaces the document of an existing page and keeps its URL. Title, description, language and expiry (`expires_at`, empty string to remove) keep their stored value unless restated; an expired page is refused until `expires_at` is given. With the `version` from `read_file` it refuses to overwrite a change made since that read. | `files:write` | **destructive**, idempotent |
 | `list_files` | Name, size, date and URL of every file, optionally under a prefix, 50 per page with a cursor, plus every page matching the prefix (not paginated). | `files:read` | read-only |
 | `get_file_info` | Details of one file, one folder or one page. | `files:read` | read-only |
+| `read_file` | Content of one file, or the HTML of one page, straight from storage (so also when it is password-protected, expired, or the client cannot reach the public URL), up to **3 MB**: UTF-8 text for text types, base64 otherwise. Returns the `version` that `update_page` and `update_file` take. | `files:read` | read-only |
 | `delete_file` | Deletes a file, a whole folder, or a page (by its prefix). Deleting the last file deletes its folder. | `files:delete` | **destructive** |
 
-Every tool returns readable text and the same data as `structuredContent` with an `outputSchema`, so clients that use either work. Failures come back as tool results with `isError: true` and a message that says what to do (auth, size, duplicate name, missing upload), never as exceptions.
+Every tool returns readable text and the same data as `structuredContent` with an `outputSchema`, so clients that use either work. The one exception is the content `read_file` returns: it travels once, as a second text block, because a copy in `structuredContent` would double a response that Vercel caps at 4.5 MB.
+
+**Editing without losing changes.** `read_file` returns a `version` (the store's ETag, without quotes). Passing it to `update_page` or `update_file` makes the write conditional: if the content changed since the read, nothing is written and the error says to read again. Both return the new `version`, so consecutive edits chain without reading in between. Without `version` they overwrite, as before. Failures come back as tool results with `isError: true` and a message that says what to do (auth, size, duplicate name, missing upload), never as exceptions.
 
 Schemas are the least common denominator every host's function calling accepts: flat objects, basic types, string enums, explicit `required`, a description on every field, no `anyOf`/`oneOf`/`$ref`/`additionalProperties`/`$schema`. `tests/mcp.test.mjs` asserts this on the real `tools/list` output.
 
-**Limits.** Vercel Functions reject request bodies above 4.5 MB, so `upload_file` accepts 3 MB of decoded content and points at `create_upload_url` above that. `publish_page` and `update_page` take the same 3 MB inline, with no presigned path: a document that large should link to its images, styles and scripts as files of their own. Files go up to 20 MB through the presigned URL, which is the share service's ceiling. Tool calls are rate limited per subject (120 per minute per instance), passphrase attempts per address (5 per 15 minutes), and the token and registration endpoints per address. These counters live in the memory of the running instance; a hard ceiling belongs in the Vercel Firewall. File content and secrets are never logged.
+**Limits.** Vercel Functions reject request bodies above 4.5 MB, so `upload_file` accepts 3 MB of decoded content and points at `create_upload_url` above that. `publish_page` and `update_page` take the same 3 MB inline, and `read_file` returns up to the same 3 MB (the same ceiling applies to function responses, and base64 adds a third), with no presigned path: a document that large should link to its images, styles and scripts as files of their own. Files go up to 20 MB through the presigned URL, which is the share service's ceiling. Tool calls are rate limited per subject (120 per minute per instance), passphrase attempts per address (5 per 15 minutes), and the token and registration endpoints per address. These counters live in the memory of the running instance; a hard ceiling belongs in the Vercel Firewall. File content and secrets are never logged.
 
 ### Environment variables
 
