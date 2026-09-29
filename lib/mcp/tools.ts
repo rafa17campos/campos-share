@@ -4,9 +4,9 @@
  * The tools the MCP endpoint offers, on top of the share operations in lib/shares.ts. The model
  * they present is a flat one: a *folder* is a share (its slug is the `prefix`), a *file* is an
  * asset in it, and a `path` is `<prefix>/<filename>`. Every tool returns readable text and the
- * same data as `structuredContent` (read_file keeps the content itself to the text), and every
- * failure is a tool result with `isError`, never an exception, so the model can read what went
- * wrong and try again.
+ * same data as `structuredContent`, except read_file, whose result is content rather than data and
+ * goes out as text alone. Every failure is a tool result with `isError`, never an exception, so the
+ * model can read what went wrong and try again.
  */
 
 import crypto from 'node:crypto';
@@ -1068,19 +1068,9 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           path: z.string().min(1).max(340).describe('A file path "<prefix>/<filename>", or a page name "<prefix>".'),
         })
       ),
-      outputSchema: lcd(
-        z.object({
-          path: z.string().describe('The path that was read.'),
-          type: z.enum(['file', 'page']).describe('Whether the path is a file in a folder or a published HTML page.'),
-          encoding: z.enum(['text', 'base64']).describe('"text" for UTF-8 text, "base64" for binary content.'),
-          content_type: z.string().describe('The MIME type the content is served with.'),
-          size_bytes: z.number().int().describe('Size of the content in bytes.'),
-          version: z
-            .string()
-            .describe('Version of this content. Pass it as "version" to update_page or update_file so they refuse to overwrite a newer change.'),
-          url: z.string().describe('Public URL of the file or page.'),
-        })
-      ),
+      // No outputSchema: a host that sees structuredContent reads only that (ChatGPT) and one that
+      // does not reads only the text, so the file would have to go out twice. As text alone it goes
+      // out once and every host reads it.
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (args, ctx) => {
@@ -1133,32 +1123,22 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           content = null;
         }
       }
-      const encoding = content === null ? ('base64' as const) : ('text' as const);
-      const body = content ?? bytes.toString('base64');
-      const structured = {
-        path: filename === null ? prefix : `${prefix}/${filename}`,
-        type: filename === null ? ('page' as const) : ('file' as const),
-        encoding,
-        content_type: contentType,
-        size_bytes: bytes.length,
-        version: contentVersion(read.etag),
-        url,
-      };
+      const encoding = content === null ? 'base64' : 'text';
+      const path = filename === null ? prefix : `${prefix}/${filename}`;
+      const version = contentVersion(read.etag);
       const next = filename === null ? 'update_page' : 'update_file';
-      // The content goes out once, in its own text block, and not again in structuredContent: a copy in
-      // each would double the response, and Vercel cuts function responses at 4.5 MB.
       return {
         content: [
           {
             type: 'text',
             text:
-              `${structured.path}: ${formatBytes(bytes.length)}, ${contentType}, ${encoding === 'text' ? 'UTF-8 text' : 'base64'}, ` +
-              `version ${structured.version}. URL: ${url}\nTo change it, send the whole new content to ${next} with ` +
-              `"version": "${structured.version}". The content follows in the next block.`,
+              `path: ${path}\ntype: ${filename === null ? 'page' : 'file'}\ncontent_type: ${contentType}\n` +
+              `encoding: ${encoding}\nsize_bytes: ${bytes.length}\nversion: ${version}\nurl: ${url}\n` +
+              `To change it, send the whole new content to ${next} with "version": "${version}". ` +
+              `The content follows in the next block${encoding === 'base64' ? ', base64-encoded' : ''}.`,
           },
-          { type: 'text', text: body },
+          { type: 'text', text: content ?? bytes.toString('base64') },
         ],
-        structuredContent: structured,
       };
     }
   );

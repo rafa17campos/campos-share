@@ -62,6 +62,17 @@ async function seedFolder(storage, slug, files, extra = {}) {
   });
 }
 
+/** The header block read_file returns, as an object: one "key: value" per line. */
+function readHeader(result) {
+  return Object.fromEntries(
+    result.content[0].text
+      .split('\n')
+      .map((line) => line.match(/^([a-z_]+): (.*)$/))
+      .filter(Boolean)
+      .map((m) => [m[1], m[2]])
+  );
+}
+
 test.afterEach(async () => {
   await closeMcpHandlerForTesting();
 });
@@ -111,7 +122,8 @@ test('tools/list advertises the ten tools with least-common-denominator schemas 
     assert.match(tool.name, /^[a-z][a-z0-9_]*$/, `${tool.name} is snake_case`);
     assert.ok(tool.title, `${tool.name} has a title`);
     assert.ok(tool.description.length > 40, `${tool.name} has a description`);
-    assert.ok(tool.outputSchema, `${tool.name} has an outputSchema`);
+    // read_file returns content, not data: text alone, so no host needs it twice.
+    if (tool.name !== 'read_file') assert.ok(tool.outputSchema, `${tool.name} has an outputSchema`);
     assert.equal(typeof tool.annotations?.readOnlyHint, 'boolean', `${tool.name} readOnlyHint`);
     assert.equal(typeof tool.annotations?.destructiveHint, 'boolean', `${tool.name} destructiveHint`);
     assert.equal(typeof tool.annotations?.idempotentHint, 'boolean', `${tool.name} idempotentHint`);
@@ -129,7 +141,7 @@ test('tools/list advertises the ten tools with least-common-denominator schemas 
         assert.ok(!(key in node), `${tool.name} inputSchema${path} must not use "${key}"`);
       }
     });
-    walk(tool.outputSchema, (node, path) => {
+    walk(tool.outputSchema ?? {}, (node, path) => {
       for (const key of ['$schema', 'anyOf', 'oneOf', '$ref']) {
         assert.ok(!(key in node), `${tool.name} outputSchema${path} must not use "${key}"`);
       }
@@ -864,17 +876,18 @@ test('read_file returns a page or a file from storage, with a version, and refus
   const page = await client.callTool({ name: 'read_file', arguments: { path: 'landing' } });
   assert.equal(page.isError, undefined, JSON.stringify(page));
   assert.equal(page.content[1].text, html, 'an expired, password-protected page is still readable by its owner');
-  assert.equal(page.structuredContent.type, 'page');
-  assert.equal(page.structuredContent.encoding, 'text');
-  assert.equal(page.structuredContent.size_bytes, Buffer.byteLength(html));
-  assert.equal(page.structuredContent.url, 'https://share.example.invalid/landing');
-  assert.equal(page.structuredContent.content, undefined, 'the content is not sent twice');
-  assert.match(page.structuredContent.version, /^[^"]+$/);
+  assert.equal(page.structuredContent, undefined, 'the content goes out once, as text');
+  const header = readHeader(page);
+  assert.equal(header.type, 'page');
+  assert.equal(header.encoding, 'text');
+  assert.equal(Number(header.size_bytes), Buffer.byteLength(html));
+  assert.equal(header.url, 'https://share.example.invalid/landing');
+  assert.match(header.version, /^[^"]+$/);
   assert.match(page.content[0].text, /update_page/);
 
   const md = await client.callTool({ name: 'read_file', arguments: { path: 'notes/readme.md' } });
   assert.equal(md.content[1].text, '# Título');
-  assert.equal(md.structuredContent.encoding, 'text');
+  assert.equal(readHeader(md).encoding, 'text');
 
   await storage.putAsset('notes', 'datos.csv', '\uFEFFnombre;año\nÑoño;2026', 'text/csv; charset=utf-8');
   const meta0 = await storage.getMeta('notes');
@@ -884,7 +897,7 @@ test('read_file returns a page or a file from storage, with a version, and refus
   assert.equal(csv.content[1].text, '\uFEFFnombre;año\nÑoño;2026', 'a byte-order mark survives a read and write round trip');
 
   const png = await client.callTool({ name: 'read_file', arguments: { path: 'notes/logo.png' } });
-  assert.equal(png.structuredContent.encoding, 'base64');
+  assert.equal(readHeader(png).encoding, 'base64');
   assert.deepEqual(Buffer.from(png.content[1].text, 'base64'), Buffer.from('\x89PNG\r\n\x1a\n\xff'));
 
   const folder = await client.callTool({ name: 'read_file', arguments: { path: 'notes' } });
@@ -925,7 +938,7 @@ test('update_page and update_file with a version refuse to overwrite a newer cha
   const client = await connect(STATIC_TOKEN);
 
   const read = await client.callTool({ name: 'read_file', arguments: { path: 'landing' } });
-  const v1 = read.structuredContent.version;
+  const v1 = readHeader(read).version;
 
   const first = await client.callTool({ name: 'update_page', arguments: { prefix: 'landing', html: '<p>v2</p>', version: v1 } });
   assert.equal(first.isError, undefined, JSON.stringify(first));
@@ -942,9 +955,9 @@ test('update_page and update_file with a version refuse to overwrite a newer cha
 
   const blind = await client.callTool({ name: 'update_page', arguments: { prefix: 'landing', html: '<p>v4</p>' } });
   assert.equal(blind.isError, undefined, 'without a version the page is overwritten as before');
-  assert.equal((await client.callTool({ name: 'read_file', arguments: { path: 'landing' } })).structuredContent.version, blind.structuredContent.version);
+  assert.equal(readHeader(await client.callTool({ name: 'read_file', arguments: { path: 'landing' } })).version, blind.structuredContent.version);
 
-  const f1 = (await client.callTool({ name: 'read_file', arguments: { path: 'notes/a.md' } })).structuredContent.version;
+  const f1 = readHeader(await client.callTool({ name: 'read_file', arguments: { path: 'notes/a.md' } })).version;
   const fileOk = await client.callTool({ name: 'update_file', arguments: { path: 'notes/a.md', content: '# b', encoding: 'text', version: f1 } });
   assert.equal(fileOk.isError, undefined, JSON.stringify(fileOk));
   const fileStale = await client.callTool({ name: 'update_file', arguments: { path: 'notes/a.md', content: '# c', encoding: 'text', version: f1 } });
