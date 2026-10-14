@@ -91,11 +91,18 @@ function getHandler(): McpHttpHandler {
   if (!handler) {
     handler = createMcpHandler(
       () => {
-        const server = new McpServer({ name: 'campos-share', version: '1.0.0' }, { instructions: INSTRUCTIONS });
+        // The tool list never changes at runtime and a stateless function has nothing to push, so
+        // listChanged stays off: advertising it makes 2026 clients open subscriptions/listen.
+        const server = new McpServer(
+          { name: 'campos-share', version: '1.0.0' },
+          { instructions: INSTRUCTIONS, capabilities: { tools: { listChanged: false } } }
+        );
         registerShareTools(server, { storage: getStorage() });
         return server;
       },
-      { legacy: 'stateless' }
+      // A listen stream is held open until the platform kills the function (300 s of provisioned
+      // memory per stream), so any subscriptions/listen is refused at once.
+      { legacy: 'stateless', maxSubscriptions: 0 }
     );
   }
   return handler;

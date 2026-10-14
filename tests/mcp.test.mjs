@@ -241,6 +241,45 @@ test('GET and DELETE answer 405, OPTIONS answers a CORS preflight', async () => 
   assert.ok(options.headers.get('access-control-allow-headers').includes('Mcp-Protocol-Version'));
 });
 
+test('no listChanged is advertised and subscriptions/listen is refused instead of held open', async () => {
+  fresh();
+  const client = await connect(STATIC_TOKEN);
+  assert.notEqual(client.getServerCapabilities()?.tools?.listChanged, true);
+  await client.close();
+
+  const res = await serveMcp(
+    new Request(MCP_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: `Bearer ${STATIC_TOKEN}`,
+        'mcp-protocol-version': '2026-07-28',
+        'mcp-method': 'subscriptions/listen',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'subscriptions/listen',
+        params: {
+          notifications: { toolsListChanged: true },
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {},
+            'io.modelcontextprotocol/clientInfo': { name: 'listener', version: '1' },
+          },
+        },
+      }),
+    })
+  );
+  const text = await Promise.race([
+    res.text(),
+    new Promise((resolve) => setTimeout(() => resolve('__still_open__'), 2000)),
+  ]);
+  assert.notEqual(text, '__still_open__');
+  assert.match(text, /"error"/);
+});
+
 test('a 2025-era client can still initialize and list tools on the same endpoint', async () => {
   fresh();
   const post = (body, headers = {}) =>
