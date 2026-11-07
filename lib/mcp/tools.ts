@@ -665,6 +665,15 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             .max(20)
             .optional()
             .describe('Content language as a BCP 47 tag, e.g. "es". Defaults to the language configured for this service.'),
+          password: z
+            .string()
+            .max(200)
+            .optional()
+            .describe('Password visitors must enter to open the page. Omit it, or send an empty string, for a page anyone with the URL can open.'),
+          expires_at: z
+            .string()
+            .optional()
+            .describe('When the page stops being served, ISO 8601. Omit it for a page with no expiry.'),
         })
       ),
       outputSchema: lcd(
@@ -675,6 +684,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           title: z.string().describe('Title stored for the page.'),
           size_bytes: z.number().int().describe('Size of the published document in bytes.'),
           created_at: z.string().describe('When the page was published, ISO 8601.'),
+          expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
+          password_protected: z.boolean().describe('Whether visitors need a password to open the page.'),
         })
       ),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -689,6 +700,11 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       }
       const html = readHtml(args.html);
       if (typeof html !== 'string') return html;
+
+      const publishExpiresAt = args.expires_at?.trim() || undefined;
+      if (publishExpiresAt && Number.isNaN(new Date(publishExpiresAt).getTime())) {
+        return fail(`"expires_at" is not a date this can read: "${publishExpiresAt}". Use ISO 8601, or omit it for no expiry.`);
+      }
 
       const existing = await storage.getMeta(prefix);
       if (existing) {
@@ -705,6 +721,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         lang: args.lang?.trim() || getDefaultLang(),
         kind: 'uploaded',
         html,
+        ...(publishExpiresAt ? { expiresAt: publishExpiresAt } : {}),
+        ...(args.password ? { password: args.password } : {}),
       });
       if (isRejection(result)) return failRejection(result);
 
@@ -715,9 +733,11 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         title: result.meta.title,
         size_bytes: Buffer.byteLength(html, 'utf8'),
         created_at: result.meta.createdAt,
+        expires_at: result.meta.expiresAt ?? undefined,
+        password_protected: Boolean(result.meta.passwordHash),
       };
       return ok(
-        `Published the page "${structured.title}" (${formatBytes(structured.size_bytes)} of HTML).\nPage URL: ${structured.url}`,
+        `Published the page "${structured.title}" (${formatBytes(structured.size_bytes)} of HTML${structured.password_protected ? ', password protected' : ''}).\nPage URL: ${structured.url}`,
         structured
       );
     }
@@ -753,6 +773,14 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
               'When the page stops being served, ISO 8601; an empty string removes the expiry. Defaults to the one the ' +
                 'page already has. Required when the page has already expired.'
             ),
+          password: z
+            .string()
+            .max(200)
+            .optional()
+            .describe(
+              'New password visitors must enter to open the page; an empty string removes the password. Defaults to the ' +
+                'one the page already has.'
+            ),
           version: versionInput,
         })
       ),
@@ -766,6 +794,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           previous_size_bytes: z.number().int().describe('Size of the document that was replaced.'),
           updated_at: z.string().describe('When the replacement happened, ISO 8601.'),
           expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
+          password_protected: z.boolean().describe('Whether visitors need a password to open the page after this call.'),
           version: z.string().describe('Version of the new document; pass it to the next update_page to chain edits without reading again.'),
         })
       ),
@@ -810,6 +839,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         kind: 'uploaded',
         html,
         ...(expiresAt !== undefined ? { expiresAt } : {}),
+        ...(args.password !== undefined ? { password: args.password } : {}),
       }, { ifVersion: args.version?.trim() || undefined });
       if (isRejection(result)) return failRejection(result);
 
@@ -824,6 +854,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         previous_size_bytes: previous,
         updated_at: new Date().toISOString(),
         expires_at: result.meta.expiresAt ?? undefined,
+        password_protected: Boolean(result.meta.passwordHash),
         version: result.pageVersion ?? '',
       };
       return ok(

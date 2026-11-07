@@ -15,6 +15,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { MemoryStorage, setStorageForTesting } from '../lib/storage.ts';
 import { closeMcpHandlerForTesting, serveMcp } from '../lib/mcp/server.ts';
 import { GET as handleViewShare } from '../app/[slug]/route.ts';
+import { verifyPassword } from '../lib/auth.ts';
 import { toolCallLimiter } from '../lib/mcp/ratelimit.ts';
 import { signAccessToken } from '../lib/oauth/tokens.ts';
 import { ALL_SCOPES } from '../lib/mcp/config.ts';
@@ -710,6 +711,44 @@ test('a page published through the tools is live at its URL and stays there when
   assert.match(secondBody, /Cenas, versión 2/);
   assert.doesNotMatch(secondBody, /<h1>Cenas<\/h1>/, 'the old document is gone');
   assert.notEqual(again.headers.get('etag'), firstEtag, 'a cached copy revalidates to the new one');
+  await client.close();
+});
+
+test('publish_page and update_page set, keep and remove a page password', async () => {
+  const storage = fresh();
+  const client = await connect(STATIC_TOKEN);
+  const view = () => handleViewShare(new Request('https://share.example.invalid/informe'), { params: Promise.resolve({ slug: 'informe' }) });
+
+  const published = await client.callTool({
+    name: 'publish_page',
+    arguments: { prefix: 'informe', html: '<h1>Secreto</h1>', title: 'Informe', password: 'clave-larga-123', expires_at: '2099-01-01T00:00:00Z' },
+  });
+  assert.equal(published.isError, undefined, JSON.stringify(published));
+  assert.equal(published.structuredContent.password_protected, true);
+  assert.equal(published.structuredContent.expires_at, '2099-01-01T00:00:00.000Z');
+  assert.match(published.content[0].text, /password protected/);
+  const hash = (await storage.getMeta('informe')).passwordHash;
+  assert.ok(hash);
+  assert.ok(await verifyPassword('clave-larga-123', hash));
+  const locked = await (await view()).text();
+  assert.match(locked, /action="\/informe\/unlock"/);
+  assert.doesNotMatch(locked, /Secreto/);
+
+  const kept = await client.callTool({ name: 'update_page', arguments: { prefix: 'informe', html: '<h1>Secreto 2</h1>' } });
+  assert.equal(kept.structuredContent.password_protected, true);
+  assert.equal((await storage.getMeta('informe')).passwordHash, hash);
+
+  const removed = await client.callTool({ name: 'update_page', arguments: { prefix: 'informe', html: '<h1>Abierto</h1>', password: '' } });
+  assert.equal(removed.structuredContent.password_protected, false);
+  assert.match(await (await view()).text(), /Abierto/);
+
+  const open = await client.callTool({ name: 'publish_page', arguments: { prefix: 'abierto', html: '<p>x</p>', title: 'Abierto', password: '' } });
+  assert.equal(open.structuredContent.password_protected, false);
+  assert.equal(open.structuredContent.expires_at, undefined);
+
+  const badDate = await client.callTool({ name: 'publish_page', arguments: { prefix: 'mal', html: '<p>x</p>', title: 'Mal', expires_at: 'mañana' } });
+  assert.equal(badDate.isError, true);
+  assert.equal(await storage.getMeta('mal'), null);
   await client.close();
 });
 
