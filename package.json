@@ -24,7 +24,7 @@
     "mcp:check": "npx -y @modelcontextprotocol/inspector --cli --server-url \"${MCP_URL:-http://localhost:3000/mcp}\" --transport http --header \"Authorization: Bearer $MCP_STATIC_TOKEN\" --method tools/list --strict"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.3.0",
     "@vercel/blob": "^2.8.0",
     "jose": "^6.2.12",
     "marked": "^18.0.13",
