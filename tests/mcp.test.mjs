@@ -15,6 +15,8 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { MemoryStorage, setStorageForTesting } from '../lib/storage.ts';
 import { closeMcpHandlerForTesting, serveMcp } from '../lib/mcp/server.ts';
 import { GET as handleViewShare } from '../app/[slug]/route.ts';
+import { POST as handleUnlockShare } from '../app/[slug]/unlock/route.ts';
+import { verifyPassword } from '../lib/auth.ts';
 import { toolCallLimiter } from '../lib/mcp/ratelimit.ts';
 import { signAccessToken } from '../lib/oauth/tokens.ts';
 import { ALL_SCOPES } from '../lib/mcp/config.ts';
@@ -710,6 +712,156 @@ test('a page published through the tools is live at its URL and stays there when
   assert.match(secondBody, /Cenas, versión 2/);
   assert.doesNotMatch(secondBody, /<h1>Cenas<\/h1>/, 'the old document is gone');
   assert.notEqual(again.headers.get('etag'), firstEtag, 'a cached copy revalidates to the new one');
+  await client.close();
+});
+
+const viewPage = (slug, cookie) =>
+  handleViewShare(
+    new Request(`https://share.example.invalid/${slug}`, cookie ? { headers: { cookie } } : {}),
+    { params: Promise.resolve({ slug }) }
+  );
+const unlockPage = (slug, password) =>
+  handleUnlockShare(
+    new Request(`https://share.example.invalid/${slug}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password }),
+    }),
+    { params: Promise.resolve({ slug }) }
+  );
+const publishLockedPage = (client, extra = {}) =>
+  client.callTool({
+    name: 'publish_page',
+    arguments: { prefix: 'informe', html: '<h1>Secreto</h1>', title: 'Informe', password: 'clave-larga-123', ...extra },
+  });
+
+test('publish_page with a password serves the unlock prompt and opens with that password', async () => {
+  const storage = fresh();
+  const client = await connect(STATIC_TOKEN);
+
+  const published = await publishLockedPage(client, { expires_at: '2099-01-01T00:00:00Z' });
+  assert.equal(published.isError, undefined, JSON.stringify(published));
+  assert.equal(published.structuredContent.password_protected, true);
+  assert.equal(published.structuredContent.expires_at, '2099-01-01T00:00:00.000Z');
+  assert.match(published.content[0].text, /password protected, expires 2099-01-01T00:00:00.000Z/);
+  assert.doesNotMatch(JSON.stringify(published), /clave-larga-123/);
+  assert.ok((await storage.getMeta('informe')).passwordHash);
+
+  const locked = await (await viewPage('informe')).text();
+  assert.match(locked, /action="\/informe\/unlock"/);
+  assert.doesNotMatch(locked, /Secreto/);
+
+  assert.equal((await unlockPage('informe', 'otra-clave-999')).headers.get('location'), '/informe?error=1');
+  const unlocked = await unlockPage('informe', 'clave-larga-123');
+  assert.equal(unlocked.headers.get('location'), '/informe');
+  const cookie = unlocked.headers.get('set-cookie').split(';')[0];
+  assert.match(await (await viewPage('informe', cookie)).text(), /Secreto/);
+  await client.close();
+});
+
+test('publish_page without a password, or with an empty one, publishes an open page with no expiry', async () => {
+  fresh();
+  const client = await connect(STATIC_TOKEN);
+  const open = await client.callTool({ name: 'publish_page', arguments: { prefix: 'abierto', html: '<p>Abierto</p>', title: 'Abierto', password: '', expires_at: '' } });
+  assert.equal(open.isError, undefined, JSON.stringify(open));
+  assert.equal(open.structuredContent.password_protected, false);
+  assert.equal(open.structuredContent.expires_at, undefined);
+  assert.match(open.content[0].text, /no password, no expiry/);
+  assert.match(await (await viewPage('abierto')).text(), /Abierto/);
+  await client.close();
+});
+
+test('update_page keeps the page password when it is omitted', async () => {
+  const storage = fresh();
+  const client = await connect(STATIC_TOKEN);
+  await publishLockedPage(client);
+  const hash = (await storage.getMeta('informe')).passwordHash;
+
+  const kept = await client.callTool({ name: 'update_page', arguments: { prefix: 'informe', html: '<h1>Secreto 2</h1>' } });
+  assert.equal(kept.structuredContent.password_protected, true);
+  assert.match(kept.content[0].text, /password protected/);
+  assert.equal((await storage.getMeta('informe')).passwordHash, hash);
+  await client.close();
+});
+
+test('update_page replaces the page password with a new one', async () => {
+  const storage = fresh();
+  const client = await connect(STATIC_TOKEN);
+  await publishLockedPage(client);
+
+  const changed = await client.callTool({ name: 'update_page', arguments: { prefix: 'informe', html: '<h1>Secreto 2</h1>', password: 'clave-nueva-456' } });
+  assert.equal(changed.structuredContent.password_protected, true);
+  const hash = (await storage.getMeta('informe')).passwordHash;
+  assert.ok(await verifyPassword('clave-nueva-456', hash));
+  assert.equal(await verifyPassword('clave-larga-123', hash), false);
+  await client.close();
+});
+
+test('update_page removes the page password on an empty string', async () => {
+  const storage = fresh();
+  const client = await connect(STATIC_TOKEN);
+  await publishLockedPage(client);
+
+  const removed = await client.callTool({ name: 'update_page', arguments: { prefix: 'informe', html: '<h1>Abierto</h1>', password: '' } });
+  assert.equal(removed.structuredContent.password_protected, false);
+  assert.match(removed.content[0].text, /no password/);
+  assert.equal((await storage.getMeta('informe')).passwordHash, null);
+  assert.match(await (await viewPage('informe')).text(), /Abierto/);
+  await client.close();
+});
+
+test('the page tools refuse a password a visitor could not type or guess, and change nothing', async () => {
+  const storage = fresh();
+  const client = await connect(STATIC_TOKEN);
+  const cases = [
+    ['   ', /whitespace/],
+    [' clave-larga-123', /whitespace/],
+    ['clave-larga-123 ', /whitespace/],
+    ['corta', /shorter than 8/],
+  ];
+  for (const [password, pattern] of cases) {
+    const result = await client.callTool({ name: 'publish_page', arguments: { prefix: 'informe', html: '<p>x</p>', title: 'T', password } });
+    assert.equal(result.isError, true, JSON.stringify(password));
+    assert.match(result.content[0].text, pattern);
+  }
+  assert.equal(await storage.getMeta('informe'), null);
+
+  await publishLockedPage(client);
+  const hash = (await storage.getMeta('informe')).passwordHash;
+  for (const [password, pattern] of cases) {
+    const result = await client.callTool({ name: 'update_page', arguments: { prefix: 'informe', html: '<p>y</p>', password } });
+    assert.equal(result.isError, true, JSON.stringify(password));
+    assert.match(result.content[0].text, pattern);
+  }
+  assert.equal((await storage.getMeta('informe')).passwordHash, hash);
+
+  const tooLong = await client.callTool({ name: 'publish_page', arguments: { prefix: 'larga', html: '<p>x</p>', title: 'T', password: 'x'.repeat(201) } });
+  assert.equal(tooLong.isError, true);
+  assert.equal(await storage.getMeta('larga'), null);
+  await client.close();
+});
+
+test('the page tools refuse an unreadable or past expires_at, and change nothing', async () => {
+  const storage = fresh();
+  const client = await connect(STATIC_TOKEN);
+  const cases = [
+    ['mañana', /"expires_at" is not a date/],
+    ['2001-01-01T00:00:00Z', /"expires_at" is in the past/],
+  ];
+  for (const [expires_at, pattern] of cases) {
+    const result = await client.callTool({ name: 'publish_page', arguments: { prefix: 'mal', html: '<p>x</p>', title: 'Mal', expires_at } });
+    assert.equal(result.isError, true, expires_at);
+    assert.match(result.content[0].text, pattern);
+  }
+  assert.equal(await storage.getMeta('mal'), null);
+
+  await publishLockedPage(client);
+  for (const [expires_at, pattern] of cases) {
+    const result = await client.callTool({ name: 'update_page', arguments: { prefix: 'informe', html: '<p>y</p>', expires_at } });
+    assert.equal(result.isError, true, expires_at);
+    assert.match(result.content[0].text, pattern);
+  }
+  assert.equal((await storage.getMeta('informe')).expiresAt, null);
   await client.close();
 });
 

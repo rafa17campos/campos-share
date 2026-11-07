@@ -153,6 +153,42 @@ function readHtml(html: string): string | CallToolResult {
   return html;
 }
 
+const MIN_PAGE_PASSWORD_LENGTH = 8;
+
+/** The expiry a page tool was given, trimmed, with "" meaning none; or the tool error explaining why it cannot be used. */
+function readExpiresArg(raw: string | undefined, emptyMeans: string): string | undefined | CallToolResult {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value === '') return '';
+  const at = new Date(value).getTime();
+  if (Number.isNaN(at)) {
+    return fail(`"expires_at" is not a date this can read: "${value}". Use ISO 8601, or ${emptyMeans}.`);
+  }
+  if (at <= Date.now()) {
+    return fail(`"expires_at" is in the past: "${value}". Use a future ISO 8601 date, or ${emptyMeans}.`);
+  }
+  return value;
+}
+
+/** The password a page tool was given, with "" meaning none; or the tool error explaining why it cannot be used. */
+function readPasswordArg(raw: string | undefined, emptyMeans: string): string | undefined | CallToolResult {
+  if (raw === undefined || raw === '') return raw;
+  if (raw.trim() !== raw) {
+    return fail(`"password" starts or ends with whitespace, which a visitor would not type. Send it without it, or ${emptyMeans}.`);
+  }
+  if (raw.length < MIN_PAGE_PASSWORD_LENGTH) {
+    return fail(`"password" is shorter than ${MIN_PAGE_PASSWORD_LENGTH} characters. Send a longer one, or ${emptyMeans}.`);
+  }
+  return raw;
+}
+
+/** How a page is reached, for the text result: whether it asks for a password and when it stops being served. */
+function describeAccess(meta: ShareMeta): string {
+  const parts = [meta.passwordHash ? 'password protected' : 'no password'];
+  parts.push(meta.expiresAt ? `expires ${meta.expiresAt}` : 'no expiry');
+  return parts.join(', ');
+}
+
 function checkFilename(filename: string): CallToolResult | null {
   if (!isValidAssetName(filename)) {
     return fail(
@@ -644,7 +680,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         'listing around it, no file name after it. Send the whole document inline as UTF-8 text, at most ' +
         `${MAX_INLINE_BYTES / (1024 * 1024)} MB; a missing lang attribute, title, description, viewport or robots ` +
         'tag is added to its <head> when it is served. A prefix that is already taken is rejected, never ' +
-        'overwritten: use update_page to replace the content of a page that exists. For an HTML file that should ' +
+        'overwritten: use update_page to replace the content of a page that exists. Pass "password" to make ' +
+        'visitors enter one before they see it, and "expires_at" to stop serving it at a date. For an HTML file that should ' +
         'sit in a folder alongside other files, use upload_file instead.',
       inputSchema: lcd(
         z.object({
@@ -665,6 +702,18 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             .max(20)
             .optional()
             .describe('Content language as a BCP 47 tag, e.g. "es". Defaults to the language configured for this service.'),
+          password: z
+            .string()
+            .max(200)
+            .optional()
+            .describe(
+              `Password visitors must enter to open the page, at least ${MIN_PAGE_PASSWORD_LENGTH} characters with no leading or ` +
+                'trailing whitespace. Omit it, or send an empty string, for a page anyone with the URL can open.'
+            ),
+          expires_at: z
+            .string()
+            .optional()
+            .describe('When the page stops being served, a future ISO 8601 date. Omit it for a page with no expiry.'),
         })
       ),
       outputSchema: lcd(
@@ -675,6 +724,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           title: z.string().describe('Title stored for the page.'),
           size_bytes: z.number().int().describe('Size of the published document in bytes.'),
           created_at: z.string().describe('When the page was published, ISO 8601.'),
+          expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
+          password_protected: z.boolean().describe('Whether visitors need a password to open the page.'),
         })
       ),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -689,6 +740,11 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       }
       const html = readHtml(args.html);
       if (typeof html !== 'string') return html;
+
+      const publishExpiresAt = readExpiresArg(args.expires_at, 'omit it for no expiry');
+      if (typeof publishExpiresAt === 'object') return publishExpiresAt;
+      const publishPassword = readPasswordArg(args.password, 'omit it for a page anyone with the URL can open');
+      if (typeof publishPassword === 'object') return publishPassword;
 
       const existing = await storage.getMeta(prefix);
       if (existing) {
@@ -705,6 +761,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         lang: args.lang?.trim() || getDefaultLang(),
         kind: 'uploaded',
         html,
+        ...(publishExpiresAt ? { expiresAt: publishExpiresAt } : {}),
+        ...(publishPassword ? { password: publishPassword } : {}),
       });
       if (isRejection(result)) return failRejection(result);
 
@@ -715,9 +773,11 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         title: result.meta.title,
         size_bytes: Buffer.byteLength(html, 'utf8'),
         created_at: result.meta.createdAt,
+        expires_at: result.meta.expiresAt ?? undefined,
+        password_protected: Boolean(result.meta.passwordHash),
       };
       return ok(
-        `Published the page "${structured.title}" (${formatBytes(structured.size_bytes)} of HTML).\nPage URL: ${structured.url}`,
+        `Published the page "${structured.title}" (${formatBytes(structured.size_bytes)} of HTML; ${describeAccess(result.meta)}).\nPage URL: ${structured.url}`,
         structured
       );
     }
@@ -731,7 +791,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       description:
         'Replace the content of a published page, keeping its URL. Send the complete new document inline as ' +
         `UTF-8 text, at most ${MAX_INLINE_BYTES / (1024 * 1024)} MB; the previous content is lost. Title, ` +
-        'description and language keep their stored value unless you pass a new one. To edit the page, read its ' +
+        'description, language, expiry and password keep their stored value unless you pass a new one. To edit the page, read its ' +
         'current HTML with read_file, change it, and send it back with the "version" read_file returned, so a ' +
         'change made in between is not overwritten. To publish a page that does not exist yet use publish_page, ' +
         'and to change one file inside a folder use update_file.',
@@ -750,8 +810,17 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             .string()
             .optional()
             .describe(
-              'When the page stops being served, ISO 8601; an empty string removes the expiry. Defaults to the one the ' +
+              'When the page stops being served, a future ISO 8601 date; an empty string removes the expiry. Defaults to the one the ' +
                 'page already has. Required when the page has already expired.'
+            ),
+          password: z
+            .string()
+            .max(200)
+            .optional()
+            .describe(
+              `New password visitors must enter to open the page, at least ${MIN_PAGE_PASSWORD_LENGTH} characters with no ` +
+                'leading or trailing whitespace; an empty string removes the password. Defaults to the ' +
+                'one the page already has.'
             ),
           version: versionInput,
         })
@@ -766,6 +835,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           previous_size_bytes: z.number().int().describe('Size of the document that was replaced.'),
           updated_at: z.string().describe('When the replacement happened, ISO 8601.'),
           expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
+          password_protected: z.boolean().describe('Whether visitors need a password to open the page after this call.'),
           version: z.string().describe('Version of the new document; pass it to the next update_page to chain edits without reading again.'),
         })
       ),
@@ -791,10 +861,10 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         );
       }
 
-      const expiresAt = args.expires_at?.trim();
-      if (expiresAt && Number.isNaN(new Date(expiresAt).getTime())) {
-        return fail(`"expires_at" is not a date this can read: "${expiresAt}". Use ISO 8601, or an empty string to remove the expiry.`);
-      }
+      const expiresAt = readExpiresArg(args.expires_at, 'an empty string to remove the expiry');
+      if (typeof expiresAt === 'object') return expiresAt;
+      const password = readPasswordArg(args.password, 'an empty string to remove the password');
+      if (typeof password === 'object') return password;
       if (expiresAt === undefined && hasExpired(meta.expiresAt)) {
         return fail(
           `The page "${prefix}" expired at ${meta.expiresAt} and is no longer served. Call update_page again with ` +
@@ -810,6 +880,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         kind: 'uploaded',
         html,
         ...(expiresAt !== undefined ? { expiresAt } : {}),
+        ...(password !== undefined ? { password } : {}),
       }, { ifVersion: args.version?.trim() || undefined });
       if (isRejection(result)) return failRejection(result);
 
@@ -824,10 +895,11 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         previous_size_bytes: previous,
         updated_at: new Date().toISOString(),
         expires_at: result.meta.expiresAt ?? undefined,
+        password_protected: Boolean(result.meta.passwordHash),
         version: result.pageVersion ?? '',
       };
       return ok(
-        `Updated the page "${structured.title}": ${formatBytes(previous)} -> ${formatBytes(size)} of HTML, version ${structured.version}. The URL is unchanged: ${structured.url}`,
+        `Updated the page "${structured.title}": ${formatBytes(previous)} -> ${formatBytes(size)} of HTML, version ${structured.version}; ${describeAccess(result.meta)}. The URL is unchanged: ${structured.url}`,
         structured
       );
     }
