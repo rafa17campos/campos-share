@@ -6,6 +6,7 @@ import {
   createUnlockCookieValue,
   unlockBinding,
 } from '../../../lib/auth.ts';
+import { clientAddress, unlockLimiter } from '../../../lib/mcp/ratelimit.ts';
 
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
@@ -17,6 +18,23 @@ export async function POST(
 
   if (!SLUG_REGEX.test(slug)) {
     return new Response('Not Found', { status: 404 });
+  }
+
+  // scrypt makes each guess slow, not few: count them, whether or not the slug exists, so the
+  // answer says nothing about which slugs do. Without an address (no proxy in front setting
+  // X-Forwarded-For, as with a bare `next start`) every visitor would share one bucket and anyone
+  // could lock a share for everyone, so the count needs an address to key on.
+  const address = clientAddress(request);
+  const limit = address === 'unknown' ? { allowed: true, retryAfterSeconds: 0 } : unlockLimiter.hit(`${address}:${slug}`);
+  if (!limit.allowed) {
+    return new Response('Demasiados intentos. Espera unos minutos y vuelve a probar.', {
+      status: 429,
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Retry-After': String(limit.retryAfterSeconds),
+        'Cache-Control': 'no-store',
+      },
+    });
   }
 
   let password = '';

@@ -19,6 +19,11 @@ import {
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 const UPLOADED_PAGE_SANDBOX = 'sandbox allow-scripts';
+/**
+ * The pages this service renders itself (a folder's page, the password prompt) run no script, so
+ * none is allowed: a link or markup that slipped past the renderer still cannot run on this origin.
+ */
+const RENDERED_PAGE_POLICY = "script-src 'none'; object-src 'self'; base-uri 'none'; form-action 'self'";
 
 /**
  * The text of every asset small enough to show in the page, so a note reads as itself rather than
@@ -101,6 +106,7 @@ export async function GET(
           'Content-Type': 'text/html; charset=utf-8',
           'Cache-Control': 'private, no-cache',
           'X-Robots-Tag': 'noindex, nofollow',
+          'Content-Security-Policy': RENDERED_PAGE_POLICY,
         },
       });
     }
@@ -152,9 +158,7 @@ export async function GET(
     'X-Content-Type-Options': 'nosniff',
     ETag: etag,
   };
-  if (sandboxPolicy) {
-    headers['Content-Security-Policy'] = sandboxPolicy;
-  }
+  headers['Content-Security-Policy'] = sandboxPolicy ?? RENDERED_PAGE_POLICY;
 
   const ifNoneMatch = request.headers.get('if-none-match');
   if (ifNoneMatch === etag) {

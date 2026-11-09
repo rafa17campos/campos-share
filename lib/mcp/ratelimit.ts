@@ -54,6 +54,8 @@ export function clientAddress(request: Request): string {
 
 /** Tool calls per authenticated subject. */
 export const toolCallLimiter = new RateLimiter(120, 60 * 1000);
+/** Share password attempts per address and share. */
+export const unlockLimiter = new RateLimiter(10, 15 * 60 * 1000);
 /** Passphrase attempts per address. */
 export const loginLimiter = new RateLimiter(5, 15 * 60 * 1000);
 /** Token endpoint requests per address. */

@@ -170,7 +170,8 @@ export interface StorageProvider {
   createUploadTokens(slug: string, files: UploadRequestFile[]): Promise<UploadTokensResult>;
   deleteShare(slug: string): Promise<void>;
   deleteBlobs(urls: string[]): Promise<void>;
-  listAllShares(): Promise<ShareMeta[]>;
+  /** Every share's record, or only those whose slug starts with `slugPrefix`, filtered before any record is read. */
+  listAllShares(slugPrefix?: string): Promise<ShareMeta[]>;
   listOrphanPrefixes(olderThanMs?: number): Promise<string[]>;
 }
 
@@ -399,15 +400,17 @@ export class VercelBlobStorage implements StorageProvider {
     }
   }
 
-  async listAllShares(): Promise<ShareMeta[]> {
+  async listAllShares(slugPrefix: string = ''): Promise<ShareMeta[]> {
     let cursor: string | undefined = undefined;
     const metaBlobs: { url: string; pathname: string }[] = [];
 
     do {
+      // Listing by prefix is a store-side filter: records of other slugs are never fetched.
       const listResult: ListBlobResult = await list({
         cursor,
         limit: 1000,
         token: this.token,
+        ...(slugPrefix ? { prefix: slugPrefix } : {}),
       });
       for (const b of listResult.blobs) {
         if (b.pathname.endsWith('/__meta.json')) {
@@ -426,7 +429,7 @@ export class VercelBlobStorage implements StorageProvider {
       const batchResults = await Promise.all(
         batch.map(async (item) => {
           try {
-            const res = await get(item.pathname, { access: BLOB_ACCESS, token: this.token });
+            const res = await get(item.pathname, { access: BLOB_ACCESS, token: this.token, useCache: false });
             if (!res || res.statusCode !== 200 || !res.stream) return null;
             const text = await new Response(res.stream).text();
             return JSON.parse(text) as ShareMeta;
@@ -633,10 +636,10 @@ export class MemoryStorage implements StorageProvider {
     }
   }
 
-  async listAllShares(): Promise<ShareMeta[]> {
+  async listAllShares(slugPrefix: string = ''): Promise<ShareMeta[]> {
     const results: ShareMeta[] = [];
     for (const [key, entry] of this.blobs.entries()) {
-      if (key.endsWith('/__meta.json')) {
+      if (key.startsWith(slugPrefix) && key.endsWith('/__meta.json')) {
         const text = new TextDecoder().decode(entry.data);
         results.push(JSON.parse(text));
       }

@@ -17,6 +17,7 @@ import {
   REFRESH_TOKEN_TTL_SECONDS,
   getIssuer,
   getOAuthSecret,
+  getPassphraseHash,
   getResourceUrl,
 } from '../mcp/config.ts';
 
@@ -46,9 +47,27 @@ export type RefreshPayload = AccessPayload;
 
 const ALG = 'HS256';
 
+/**
+ * A fingerprint of the login passphrase's hash, carried by every artefact signed here (pending
+ * request, code, access and refresh token) and checked on every use: changing the passphrase
+ * (`npm run passphrase:hash`) ends every grant made with the old one, including a code minted a
+ * moment before, without rotating MCP_OAUTH_SECRET and without storing anything. Memoised on the
+ * configured value, so it is computed once per passphrase rather than once per request.
+ */
+let fingerprintCache: { hash: string; fingerprint: string } | null = null;
+
+function passphraseFingerprint(): string {
+  const hash = getPassphraseHash();
+  if (fingerprintCache?.hash !== hash) {
+    const fingerprint = crypto.createHash('sha256').update(`mcp-login\n${hash}`).digest('base64url').slice(0, 22);
+    fingerprintCache = { hash, fingerprint };
+  }
+  return fingerprintCache.fingerprint;
+}
+
 async function sign(kind: TokenKind, claims: Record<string, unknown>, ttlSeconds: number, audience: string) {
   const now = Math.floor(Date.now() / 1000);
-  return new SignJWT({ ...claims, kind })
+  return new SignJWT({ ...claims, kind, pf: passphraseFingerprint() })
     .setProtectedHeader({ alg: ALG })
     .setIssuer(getIssuer())
     .setAudience(audience)
@@ -66,6 +85,7 @@ async function verify(kind: TokenKind, token: string, audience: string): Promise
       algorithms: [ALG],
     });
     if (payload.kind !== kind) return null;
+    if (payload.pf !== passphraseFingerprint()) return null;
     return payload;
   } catch (err) {
     if (err instanceof joseErrors.JOSEError) return null;

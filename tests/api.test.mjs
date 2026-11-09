@@ -713,7 +713,10 @@ test('An uploaded page is sandboxed into an opaque origin; a generated one is no
     { params: Promise.resolve({ slug: 'propia' }) }
   );
   assert.equal(generated.status, 200);
-  assert.equal(generated.headers.get('content-security-policy'), null);
+  // A page we render ourselves runs no script: no sandbox needed, but no script allowed either.
+  const ownCsp = generated.headers.get('content-security-policy');
+  assert.ok(!ownCsp.includes('sandbox'), ownCsp);
+  assert.match(ownCsp, /script-src 'none'/);
 });
 
 test('Shows a markdown asset as the page, not as a download card', async () => {

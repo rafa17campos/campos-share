@@ -6,6 +6,7 @@ process.env.SHARE_API_TOKEN = 'secret-test-token-xyz789';
 process.env.SHARE_COOKIE_SECRET = 'cookie-secret-test-abc123';
 process.env.SHARE_BASE_URL = 'https://share.example.invalid';
 process.env.MCP_OAUTH_SECRET = 'test-oauth-signing-secret-with-enough-length-0123456789';
+process.env.MCP_LOGIN_PASSPHRASE_HASH ??= 'scrypt$N=32768$r=8$p=1$00$00';
 process.env.MCP_STATIC_TOKEN = 'static-terminal-token-0123456789abcdefghij';
 delete process.env.MCP_STATIC_TOKEN_SCOPES;
 delete process.env.MCP_ALLOWED_ORIGINS;

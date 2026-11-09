@@ -992,7 +992,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         }
       }
 
-      const matching = (await listShares(storage)).filter(
+      const matching = (await listShares(storage, prefix)).filter(
         (m) => prefix === '' || m.slug === prefix || m.slug.startsWith(prefix)
       );
       const all = matching.filter((m) => m.kind === 'generated').flatMap(fileItems);

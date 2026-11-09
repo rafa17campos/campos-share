@@ -605,7 +605,7 @@ export async function deleteShare(storage: StorageProvider, slug: string): Promi
 }
 
 /** Every share, oldest first, so pages and listings are stable between calls. */
-export async function listShares(storage: StorageProvider): Promise<ShareMeta[]> {
-  const all = await storage.listAllShares();
+export async function listShares(storage: StorageProvider, slugPrefix: string = ''): Promise<ShareMeta[]> {
+  const all = await storage.listAllShares(slugPrefix);
   return all.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.slug.localeCompare(b.slug));
 }
