@@ -19,6 +19,7 @@ import {
   getDocument,
   listCollections,
   listDocuments,
+  pageDbAddressLimiter,
   pageDbReadLimiter,
   pageDbTokenFromRequest,
   pageDbWriteLimiter,
@@ -113,15 +114,20 @@ async function authorize(
 }
 
 /**
- * Requests made with a page token, counted per address and page before any storage is touched, so
- * a page polling too fast, or a forged token, costs no Blob operation once over the limit.
+ * Requests made with a page token, counted before any storage is touched: per address and page, and
+ * per address across pages, so neither a page polling too fast nor forged tokens sprayed over many
+ * slugs cost a Blob operation once over the limit.
  */
 function rateLimit(request: Request, target: Target, creds: Credentials, mode: 'read' | 'write'): Response | null {
   if (creds.caller !== 'page') return null;
+  const address = clientAddress(request);
   const limiter: RateLimiter = mode === 'write' ? pageDbWriteLimiter : pageDbReadLimiter;
-  const decision = limiter.hit(`${clientAddress(request)}:${target.slug}`);
-  if (decision.allowed) return null;
-  return json({ error: `Too many ${mode}s; try again shortly` }, 429, { 'Retry-After': String(decision.retryAfterSeconds) });
+  for (const decision of [pageDbAddressLimiter.hit(address), limiter.hit(`${address}:${target.slug}`)]) {
+    if (!decision.allowed) {
+      return json({ error: `Too many requests; try again shortly` }, 429, { 'Retry-After': String(decision.retryAfterSeconds) });
+    }
+  }
+  return null;
 }
 
 /** The body, read up to MAX_BODY_BYTES and no further, as `{ data }`. */
@@ -181,24 +187,32 @@ export const GET = guarded(async (request, ctx) => {
   if (!target) return json({ error: 'Not Found' }, 404);
   const creds = credentialsOf(request);
   if (!creds) return json(UNAUTHORIZED, 401);
-  const limited = rateLimit(request, target, creds, 'read');
-  if (limited) return limited;
-  // The record and the store are read at the same time; the data is only answered once allowed.
-  const pending = read(target).then(
-    (response) => ({ response }),
-    (error: unknown) => ({ error })
-  );
-  const denied = await authorize(request, target, creds, 'read');
-  const outcome = await pending;
+  // Authorized before the store is read, so a forged token costs one record read and no more.
+  const denied = rateLimit(request, target, creds, 'read') ?? (await authorize(request, target, creds, 'read'));
   if (denied) return denied;
-  if ('error' in outcome) throw outcome.error;
-  return outcome.response;
+  return read(target);
 });
 
-async function startWrite(request: Request, target: Target): Promise<Response | null> {
+/**
+ * Checks and body of a write, in the order that keeps the window between authorizing and writing
+ * short: credentials and rate limit (no I/O), then the body (however slowly it arrives), then the
+ * record, read last so a page deleted, recreated, expired or switched off while the body was on its
+ * way is judged as it is now.
+ */
+async function prepareWrite(request: Request, target: Target, withBody: boolean): Promise<Response | { creds: Credentials; data: unknown }> {
   const creds = credentialsOf(request);
   if (!creds) return json(UNAUTHORIZED, 401);
-  return rateLimit(request, target, creds, 'write') ?? authorize(request, target, creds, 'write');
+  const limited = rateLimit(request, target, creds, 'write');
+  if (limited) return limited;
+  let data: unknown;
+  if (withBody) {
+    const body = await readData(request);
+    if (body instanceof Response) return body;
+    data = body.data;
+  }
+  const denied = await authorize(request, target, creds, 'write');
+  if (denied) return denied;
+  return { creds, data };
 }
 
 export const POST = guarded(async (request, ctx) => {
@@ -207,11 +221,9 @@ export const POST = guarded(async (request, ctx) => {
   if (target.id !== undefined) {
     return json({ error: 'POST adds a document with a new id to a collection; use PUT to write a document by id' }, 405);
   }
-  const denied = await startWrite(request, target);
-  if (denied) return denied;
-  const body = await readData(request);
-  if (body instanceof Response) return body;
-  const result = await writeDocument(getStorage(), target.slug, target.collection, 'add', undefined, body.data);
+  const ready = await prepareWrite(request, target, true);
+  if (ready instanceof Response) return ready;
+  const result = await writeDocument(getStorage(), target.slug, target.collection, 'add', undefined, ready.data);
   if (isRejection(result)) return reject(result);
   return json(result.document, 201);
 });
@@ -220,11 +232,9 @@ function writeById(action: 'set' | 'update') {
   return guarded(async (request, ctx) => {
     const target = await readTarget(ctx);
     if (!target || target.collection === undefined || target.id === undefined) return json({ error: 'Not Found' }, 404);
-    const denied = await startWrite(request, target);
-    if (denied) return denied;
-    const body = await readData(request);
-    if (body instanceof Response) return body;
-    const result = await writeDocument(getStorage(), target.slug, target.collection, action, target.id, body.data);
+    const ready = await prepareWrite(request, target, true);
+    if (ready instanceof Response) return ready;
+    const result = await writeDocument(getStorage(), target.slug, target.collection, action, target.id, ready.data);
     if (isRejection(result)) return reject(result);
     return json(result.document, result.created ? 201 : 200);
   });
@@ -236,14 +246,12 @@ export const PATCH = writeById('update');
 export const DELETE = guarded(async (request, ctx) => {
   const target = await readTarget(ctx);
   if (!target || target.collection === undefined) return json({ error: 'Not Found' }, 404);
-  const creds = credentialsOf(request);
-  if (!creds) return json(UNAUTHORIZED, 401);
-  const denied = rateLimit(request, target, creds, 'write') ?? (await authorize(request, target, creds, 'write'));
-  if (denied) return denied;
+  const ready = await prepareWrite(request, target, false);
+  if (ready instanceof Response) return ready;
   const storage = getStorage();
 
   if (target.id === undefined) {
-    if (creds.caller !== 'owner') return json({ error: 'Only the owner can delete a whole collection' }, 403);
+    if (ready.creds.caller !== 'owner') return json({ error: 'Only the owner can delete a whole collection' }, 403);
     const result = await deleteCollection(storage, target.slug, target.collection);
     if (isRejection(result)) return reject(result);
     return json(result, 200);

@@ -134,6 +134,8 @@ export function pageDbTokenFromRequest(request: Request): string | null {
 export const pageDbWriteLimiter = new RateLimiter(60, 60 * 1000);
 /** Reads made with a page token, per address and page: room for a page polling every second or so. */
 export const pageDbReadLimiter = new RateLimiter(120, 60 * 1000);
+/** Every request made with a page token, per address across all pages, so rotating slugs gains nothing. */
+export const pageDbAddressLimiter = new RateLimiter(300, 60 * 1000);
 
 /* ------------------------------------------------------------------------------------------ */
 /* Names and payloads                                                                          */
@@ -272,6 +274,18 @@ export async function listCollections(storage: StorageProvider, slug: string): P
     .map((name) => ({ name, count: Object.keys(db.collections[name]).length }));
 }
 
+function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Oldest first, then by id, by plain code-unit order (not locale order), so a cursor that compares
+ * with < and > walks the list in exactly this order.
+ */
+export function compareDocuments(a: DbDocument, b: DbDocument): number {
+  return compareCodeUnits(a.createdAt, b.createdAt) || compareCodeUnits(a.id, b.id);
+}
+
 /** Every document of a collection, oldest first; an empty list for a collection that does not exist. */
 export async function listDocuments(
   storage: StorageProvider,
@@ -284,7 +298,7 @@ export async function listDocuments(
   const docs = own(db.collections, collection) ?? {};
   return Object.entries(docs)
     .map(([id, doc]) => toDocument(id, doc))
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    .sort(compareDocuments);
 }
 
 export async function getDocument(

@@ -1398,15 +1398,20 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       if (id === undefined) {
         const docs = await listDocuments(storage, prefix, collection);
         if (isRejection(docs)) return fail(docs.error);
+        // The cursor names the last document returned, not a position, so documents deleted or added
+        // between calls never make the next page skip or repeat one. The order is (createdAt, id),
+        // and a document keeps its createdAt when it is rewritten.
         let offset = 0;
         if (args.cursor) {
+          let after: { c: string; i: string };
           try {
-            const parsed = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf8'));
-            if (typeof parsed?.o !== 'number' || parsed.o < 0) throw new Error('bad cursor');
-            offset = parsed.o;
+            after = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf8'));
+            if (typeof after?.c !== 'string' || typeof after?.i !== 'string') throw new Error('bad cursor');
           } catch {
             return fail('cursor is not one this server issued; call read_page_data without a cursor to start over.');
           }
+          const next = docs.findIndex((d) => d.createdAt > after.c || (d.createdAt === after.c && d.id > after.i));
+          offset = next < 0 ? docs.length : next;
         }
         // Each page of results stays well under the response ceiling, counting both copies of it.
         const documents: ReturnType<typeof toDocumentItem>[] = [];
@@ -1420,11 +1425,12 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         }
         const nextOffset = offset + documents.length;
         const structured: Record<string, unknown> = { prefix, database, collection, documents, total_count: docs.length };
-        if (nextOffset < docs.length) {
-          structured.next_cursor = Buffer.from(JSON.stringify({ o: nextOffset })).toString('base64url');
+        if (nextOffset < docs.length && documents.length > 0) {
+          const last = documents[documents.length - 1];
+          structured.next_cursor = Buffer.from(JSON.stringify({ c: last.created_at, i: last.id })).toString('base64url');
         }
         const text = docs.length
-          ? `${docs.length} document${docs.length === 1 ? '' : 's'} in "${prefix}" / "${collection}"${off}, showing ${offset + 1}-${nextOffset}, ` +
+          ? `${docs.length} document${docs.length === 1 ? '' : 's'} in "${prefix}" / "${collection}"${off}, showing ${documents.length ? `${offset + 1}-${nextOffset}` : 'none after the cursor'}, ` +
             'one JSON object per line:\n' +
             documents.map((d) => JSON.stringify(d)).join('\n') +
             (structured.next_cursor ? `\nMore documents available: call again with cursor "${structured.next_cursor}".` : '')
@@ -1438,7 +1444,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         return fail(doc.error);
       }
       const document = toDocumentItem(doc);
-      return ok(`"${prefix}" / "${collection}" / "${id}"${off}:\n${JSON.stringify(document, null, 2)}`, {
+      // Compact JSON everywhere: indentation grows with nesting depth, not with the data.
+      return ok(`"${prefix}" / "${collection}" / "${id}"${off}:\n${JSON.stringify(document)}`, {
         prefix,
         database,
         collection,
@@ -1526,7 +1533,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       if (isRejection(result)) return fail(result.error);
       const document = toDocumentItem(result.document);
       const verb = args.action === 'add' ? 'Added' : args.action === 'set' ? (result.created ? 'Created' : 'Replaced') : result.created ? 'Created' : 'Updated';
-      return ok(`${verb} "${prefix}" / "${collection}" / "${document.id}":\n${JSON.stringify(document.data, null, 2)}`, {
+      return ok(`${verb} "${prefix}" / "${collection}" / "${document.id}":\n${JSON.stringify(document.data)}`, {
         prefix,
         collection,
         action: args.action,

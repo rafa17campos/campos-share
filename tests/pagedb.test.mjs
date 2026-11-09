@@ -21,6 +21,7 @@ import {
   issuePageDbToken,
   listCollections,
   listDocuments,
+  pageDbAddressLimiter,
   pageDbReadLimiter,
   pageDbWriteLimiter,
   verifyPageDbToken,
@@ -44,6 +45,7 @@ function fresh() {
   setStorageForTesting(storage);
   pageDbWriteLimiter.reset();
   pageDbReadLimiter.reset();
+  pageDbAddressLimiter.reset();
   toolCallLimiter.reset();
   return storage;
 }
@@ -381,7 +383,8 @@ test('the injected client works end to end against the API', async () => {
   const storage = fresh();
   await publishPage(storage, 'cliente');
   const { html } = await viewPage('cliente');
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const start = html.indexOf('<script>') + '<script>'.length;
+  const script = html.slice(start, html.indexOf('</script>', start));
 
   const fetchThroughRoute = async (url, init = {}) => {
     const u = new URL(url);
@@ -531,6 +534,78 @@ test('turning the database on creates the store once; replaces after that do not
   assert.equal(created.meta.database, true);
 });
 
+test('a write whose body arrives slowly is judged against the page as it is when the body is in', async () => {
+  const storage = fresh();
+  const meta = await publishPage(storage, 'lenta');
+  const token = issuePageDbToken(meta);
+
+  const slowPut = (onFirstPull) => {
+    let pulled = false;
+    const body = new ReadableStream({
+      async pull(controller) {
+        if (!pulled) {
+          pulled = true;
+          await onFirstPull();
+          controller.enqueue(new TextEncoder().encode('{"data": {"intruso": true}}'));
+        } else controller.close();
+      },
+    });
+    const request = new Request(`${BASE}/api/db/lenta/c/a`, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body,
+      duplex: 'half',
+    });
+    return dbRoute.PUT(request, { params: Promise.resolve({ slug: 'lenta', path: ['c', 'a'] }) });
+  };
+
+  // Deleted and published again while the body was on its way: the old token is refused.
+  const recreated = await slowPut(async () => {
+    await deleteShare(storage, 'lenta');
+    await new Promise((r) => setTimeout(r, 5));
+    await publishPage(storage, 'lenta');
+  });
+  assert.equal(recreated.status, 401);
+  assert.deepEqual(await listCollections(storage, 'lenta'), [], 'nothing written into the new page');
+
+  // Deleted outright: refused, and no orphan store is left behind.
+  const fresh2 = issuePageDbToken(await storage.getMeta('lenta'));
+  const goneBody = new ReadableStream({
+    async pull(controller) {
+      await deleteShare(storage, 'lenta');
+      controller.enqueue(new TextEncoder().encode('{"data": 1}'));
+      controller.close();
+    },
+  });
+  const gone = await dbRoute.PUT(
+    new Request(`${BASE}/api/db/lenta/c/a`, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${fresh2}`, 'content-type': 'application/json' },
+      body: goneBody,
+      duplex: 'half',
+    }),
+    { params: Promise.resolve({ slug: 'lenta', path: ['c', 'a'] }) }
+  );
+  assert.equal(gone.status, 401);
+  assert.ok(!storage.blobs.has(`lenta/${PAGE_DB_ASSET_NAME}`));
+});
+
+test('forged tokens spread over many slugs hit a per-address limit and never read a store', async () => {
+  const storage = fresh();
+  let metaReads = 0;
+  let storeReads = 0;
+  const getMeta = storage.getMeta.bind(storage);
+  const getAsset = storage.getAsset.bind(storage);
+  storage.getMeta = (...a) => (metaReads++, getMeta(...a));
+  storage.getAsset = (...a) => (storeReads++, getAsset(...a));
+  const headers = { 'x-forwarded-for': '192.0.2.44' };
+  let last;
+  for (let i = 0; i < 301; i++) last = await db('GET', `slug-${i}/c`, { token: 'pagedb.1.00', headers });
+  assert.equal(last.status, 429);
+  assert.equal(metaReads, 300, 'one record read per allowed request, none once limited');
+  assert.equal(storeReads, 0, 'a forged token never reaches the store');
+});
+
 /* ------------------------------------------------------------------------------------------ */
 /* MCP                                                                                         */
 /* ------------------------------------------------------------------------------------------ */
@@ -657,5 +732,49 @@ test('MCP: read_page_data pages a large collection by size', async (t) => {
   assert.equal(new Set(seen).size, 24);
   const bad = await client.callTool({ name: 'read_page_data', arguments: { prefix: 'grande', collection: 'docs', cursor: 'nope' } });
   assert.equal(bad.isError, true);
+  await client.close();
+});
+
+test('MCP: read_page_data cursor survives deletions between pages, and ids sort by code unit', async (t) => {
+  t.after(() => closeMcpHandlerForTesting());
+  const storage = fresh();
+  await publishPage(storage, 'orden');
+  const filler = 'q'.repeat(60 * 1024);
+  // Ids with mixed case and "-"/"_", where locale order and code-unit order disagree.
+  const ids = ['b', 'B', 'a-1', 'a_1', 'Z', 'z', 'A', 'm', 'M', 'n-2', 'n_2', 'Y'];
+  for (const id of ids) {
+    const r = await writeDocument(storage, 'orden', 'docs', 'set', id, { filler });
+    assert.equal(r.created, true, JSON.stringify(r).slice(0, 200));
+  }
+  const client = await connect(await signAccessToken({ client_id: 'dcr.test', sub: 'owner', scope: ALL_SCOPES }));
+  const page = (cursor) =>
+    client.callTool({ name: 'read_page_data', arguments: { prefix: 'orden', collection: 'docs', ...(cursor ? { cursor } : {}) } });
+
+  const first = await page();
+  const firstIds = first.structuredContent.documents.map((d) => d.id);
+  assert.ok(first.structuredContent.next_cursor);
+  // Someone deletes a document already seen: the next page must not skip an unseen one.
+  await deleteDocument(storage, 'orden', 'docs', firstIds[0]);
+  const seen = [...firstIds];
+  let cursor = first.structuredContent.next_cursor;
+  while (cursor) {
+    const r = await page(cursor);
+    seen.push(...r.structuredContent.documents.map((d) => d.id));
+    cursor = r.structuredContent.next_cursor;
+  }
+  assert.deepEqual([...seen].sort(), [...ids].sort(), 'every document seen exactly once');
+  assert.equal(new Set(seen).size, seen.length);
+
+  // A deeply nested document comes back compact, not indented by its depth.
+  let deep = 1;
+  for (let i = 0; i < 2000; i++) deep = { n: deep };
+  const wrote = await client.callTool({
+    name: 'write_page_data',
+    arguments: { prefix: 'orden', collection: 'hondo', action: 'set', id: 'x', data_json: JSON.stringify(deep) },
+  });
+  assert.equal(wrote.isError, undefined);
+  assert.ok(Buffer.byteLength(wrote.content[0].text) < 40 * 1024, `write result is ${Buffer.byteLength(wrote.content[0].text)} bytes`);
+  const read = await client.callTool({ name: 'read_page_data', arguments: { prefix: 'orden', collection: 'hondo', id: 'x' } });
+  assert.ok(Buffer.byteLength(read.content[0].text) < 40 * 1024);
   await client.close();
 });
