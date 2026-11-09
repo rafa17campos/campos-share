@@ -11,7 +11,7 @@ delete process.env.MCP_STATIC_TOKEN_SCOPES;
 delete process.env.MCP_ALLOWED_ORIGINS;
 
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { MemoryStorage, setStorageForTesting } from '../lib/storage.ts';
+import { AssetConflictError, MemoryStorage, setStorageForTesting } from '../lib/storage.ts';
 import { createShare, replaceShare, deleteShare } from '../lib/shares.ts';
 import {
   DB_LIMITS,
@@ -21,6 +21,7 @@ import {
   issuePageDbToken,
   listCollections,
   listDocuments,
+  pageDbReadLimiter,
   pageDbWriteLimiter,
   verifyPageDbToken,
   writeDocument,
@@ -42,6 +43,7 @@ function fresh() {
   const storage = new MemoryStorage();
   setStorageForTesting(storage);
   pageDbWriteLimiter.reset();
+  pageDbReadLimiter.reset();
   toolCallLimiter.reset();
   return storage;
 }
@@ -408,6 +410,127 @@ test('the injected client works end to end against the API', async () => {
   await assert.rejects(shareDb.set('Mal', 'x', 1), (err) => err.status === 400 && /collection name/.test(err.message));
 });
 
+test('a forged page token learns nothing about which slugs exist', async () => {
+  const storage = fresh();
+  await publishPage(storage, 'existe');
+  await storage.saveMeta('carpeta', { slug: 'carpeta', title: 'c', lang: 'es', createdAt: new Date().toISOString(), kind: 'generated', assets: [] });
+  const answers = await Promise.all(
+    ['existe', 'carpeta', 'no-existe'].map((slug) => db('GET', `${slug}/c`, { token: 'pagedb.1.00' }))
+  );
+  for (const a of answers) {
+    assert.equal(a.status, 401);
+    assert.deepEqual(a.body, answers[0].body);
+  }
+  // A valid token for one page opens no other page.
+  const token = issuePageDbToken(await storage.getMeta('existe'));
+  await publishPage(storage, 'otra');
+  const other = await db('GET', 'otra/c', { token });
+  assert.equal(other.status, 401);
+  assert.deepEqual(other.body, answers[0].body);
+});
+
+test('failures the rules did not foresee still answer JSON with CORS; contention is a 409', async () => {
+  const storage = fresh();
+  const meta = await publishPage(storage, 'rota');
+  const token = issuePageDbToken(meta);
+
+  const original = storage.getAsset.bind(storage);
+  storage.getAsset = async () => {
+    throw new Error('blob down');
+  };
+  const down = await db('GET', 'rota/c', { token });
+  assert.equal(down.status, 503);
+  assert.equal(down.headers.get('access-control-allow-origin'), '*');
+  assert.match(down.body.error, /unavailable/);
+  storage.getAsset = original;
+
+  storage.putAsset = async (slug, name) => {
+    throw new AssetConflictError(slug, name);
+  };
+  const busy = await writeDocument(storage, 'rota', 'c', 'set', 'a', 1);
+  assert.equal(busy.status, 409);
+  assert.match(busy.error, /busy/);
+  const busyHttp = await db('PUT', 'rota/c/a', { token, body: { data: 1 } });
+  assert.equal(busyHttp.status, 409);
+  assert.equal(busyHttp.headers.get('access-control-allow-origin'), '*');
+});
+
+test('reads with a page token are rate limited before any storage is read', async () => {
+  const storage = fresh();
+  const meta = await publishPage(storage, 'sondeo');
+  const token = issuePageDbToken(meta);
+  const headers = { 'x-forwarded-for': '198.51.100.7' };
+  for (let i = 0; i < 120; i++) assert.equal((await db('GET', 'sondeo/c', { token, headers })).status, 200);
+  let reads = 0;
+  const getAsset = storage.getAsset.bind(storage);
+  const getMeta = storage.getMeta.bind(storage);
+  storage.getAsset = (...a) => (reads++, getAsset(...a));
+  storage.getMeta = (...a) => (reads++, getMeta(...a));
+  const limited = await db('GET', 'sondeo/c', { token, headers });
+  assert.equal(limited.status, 429);
+  assert.equal(reads, 0);
+  assert.equal((await db('GET', 'sondeo/c', { token: OWNER, headers })).status, 200, 'the owner is not limited');
+});
+
+test('request bodies are capped while read, and only the parsed document size counts', async () => {
+  const storage = fresh();
+  const meta = await publishPage(storage, 'cuerpos');
+  const token = issuePageDbToken(meta);
+
+  const declared = await db('PUT', 'cuerpos/c/a', { token, body: { data: 1 }, headers: { 'content-length': String(10 * 1024 * 1024) } });
+  assert.equal(declared.status, 413);
+
+  // A streamed body with no declared length is cut off at the ceiling, not buffered whole.
+  let pulled = 0;
+  const chunk = new TextEncoder().encode('x'.repeat(64 * 1024));
+  const stream = new ReadableStream({
+    pull(controller) {
+      pulled++;
+      if (pulled > 100) controller.close();
+      else controller.enqueue(chunk);
+    },
+  });
+  const request = new Request(`${BASE}/api/db/cuerpos/c/a`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: stream,
+    duplex: 'half',
+  });
+  const res = await dbRoute.PUT(request, { params: Promise.resolve({ slug: 'cuerpos', path: ['c', 'a'] }) });
+  assert.equal(res.status, 413);
+  assert.ok(pulled < 10, `stopped reading early (pulled ${pulled} chunks)`);
+
+  // Pretty-printed JSON around a document under its limit is accepted.
+  const near = { texto: 'z'.repeat(DB_LIMITS.documentBytes - 1024) };
+  const pretty = JSON.stringify({ data: near }, null, 8) + ' '.repeat(8 * 1024);
+  assert.ok(Buffer.byteLength(pretty) > DB_LIMITS.documentBytes + 1024);
+  assert.equal((await db('PUT', 'cuerpos/c/b', { token, body: pretty })).status, 201);
+});
+
+test('turning the database on creates the store once; replaces after that do not touch it, and a failure there does not fail the publish', async () => {
+  const storage = fresh();
+  await publishPage(storage, 'una-vez', { database: false });
+  let heads = 0;
+  const headAsset = storage.headAsset.bind(storage);
+  storage.headAsset = (slug, name) => (name === PAGE_DB_ASSET_NAME && heads++, headAsset(slug, name));
+  const body = { title: 't', lang: 'es', kind: 'uploaded', html: '<p>x</p>' };
+  await replaceShare(storage, 'una-vez', { ...body, database: true });
+  assert.equal(heads, 1);
+  assert.ok(storage.blobs.has(`una-vez/${PAGE_DB_ASSET_NAME}`));
+  await replaceShare(storage, 'una-vez', body);
+  await replaceShare(storage, 'una-vez', { ...body, database: true });
+  assert.equal(heads, 1, 'already on: no extra round trip');
+
+  const putAsset = storage.putAsset.bind(storage);
+  storage.putAsset = (slug, name, ...rest) => {
+    if (name === PAGE_DB_ASSET_NAME) throw new Error('blob hiccup');
+    return putAsset(slug, name, ...rest);
+  };
+  const created = await createShare(storage, 'tolerante', { ...body, database: true });
+  assert.equal(created.created, true);
+  assert.equal(created.meta.database, true);
+});
+
 /* ------------------------------------------------------------------------------------------ */
 /* MCP                                                                                         */
 /* ------------------------------------------------------------------------------------------ */
@@ -508,5 +631,31 @@ test('MCP: publish_page with a database, then read_page_data and write_page_data
   assert.equal(folder.isError, true);
   assert.match(folder.content[0].text, /not a page/);
 
+  await client.close();
+});
+
+test('MCP: read_page_data pages a large collection by size', async (t) => {
+  t.after(() => closeMcpHandlerForTesting());
+  const storage = fresh();
+  await publishPage(storage, 'grande');
+  const filler = 'q'.repeat(40 * 1024);
+  for (let i = 0; i < 24; i++) await writeDocument(storage, 'grande', 'docs', 'set', `d${String(i).padStart(2, '0')}`, { filler });
+  const client = await connect(process.env.MCP_STATIC_TOKEN);
+  const seen = [];
+  let cursor;
+  let calls = 0;
+  do {
+    const r = await client.callTool({ name: 'read_page_data', arguments: { prefix: 'grande', collection: 'docs', ...(cursor ? { cursor } : {}) } });
+    assert.equal(r.isError, undefined, JSON.stringify(r).slice(0, 300));
+    assert.equal(r.structuredContent.total_count, 24);
+    assert.ok(Buffer.byteLength(r.content[0].text) < 600 * 1024);
+    seen.push(...r.structuredContent.documents.map((d) => d.id));
+    cursor = r.structuredContent.next_cursor;
+    calls++;
+  } while (cursor);
+  assert.ok(calls > 1, 'more than one page');
+  assert.equal(new Set(seen).size, 24);
+  const bad = await client.callTool({ name: 'read_page_data', arguments: { prefix: 'grande', collection: 'docs', cursor: 'nope' } });
+  assert.equal(bad.isError, true);
   await client.close();
 });

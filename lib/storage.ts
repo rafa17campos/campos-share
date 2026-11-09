@@ -255,9 +255,11 @@ export class VercelBlobStorage implements StorageProvider {
       if (err instanceof BlobPreconditionFailedError || (err as { name?: string })?.name === 'BlobPreconditionFailedError') {
         throw new AssetConflictError(slug, filename);
       }
-      // Blob reports a create-only put onto an existing pathname as a plain error naming it.
-      if (options.ifAbsent && /already exists/i.test((err as Error)?.message ?? '')) {
-        throw new AssetConflictError(slug, filename);
+      // Blob has no dedicated error for a create-only put onto an existing pathname (the SDK reports
+      // it as an unknown error), so ask the store: if the file exists now, somebody else created it.
+      if (options.ifAbsent) {
+        const now = await this.headAsset(slug, filename).catch(() => null);
+        if (now?.exists) throw new AssetConflictError(slug, filename);
       }
       throw err;
     }

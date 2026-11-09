@@ -42,7 +42,6 @@ import {
   checkDbAccess,
   deleteDocument,
   getDocument,
-  isDbRejection,
   listCollections,
   listDocuments,
   writeDocument,
@@ -1318,6 +1317,8 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
     }
   );
   /* ------------------------------------------------------------- page database --------- */
+  /** Serialised documents per read_page_data result; the result carries them twice (text and structured). */
+  const DATA_PAGE_BYTES = 512 * 1024;
   const documentSchema = z.object({
     id: z.string().describe('The document id.'),
     data: z.unknown().describe('The stored JSON value.'),
@@ -1345,12 +1346,14 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         'its collections and how many documents each holds; with "collection", every document in it, oldest first; ' +
         'with "collection" and "id", one document. This is the data visitors wrote through window.shareDb. It reads ' +
         'straight from storage, so it works on password-protected and expired pages, and on a page whose database ' +
-        'was turned off (the data is kept).',
+        'was turned off (the data is kept). A large collection comes in pages of results: when "next_cursor" is ' +
+        'present, call again with it as "cursor".',
       inputSchema: lcd(
         z.object({
           prefix: z.string().min(1).max(80).describe('The page whose data to read, the name it is published under.'),
           collection: z.string().max(64).optional().describe('A collection to list. Omit to list the collections.'),
           id: z.string().max(128).optional().describe('One document to read from "collection". Omit to list the whole collection.'),
+          cursor: z.string().max(200).optional().describe('The "next_cursor" value from a previous call, to continue listing a collection.'),
         })
       ),
       outputSchema: lcd(
@@ -1362,7 +1365,9 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             .optional()
             .describe('The collections, when no collection was given.'),
           collection: z.string().optional().describe('The collection read, when one was given.'),
-          documents: z.array(documentSchema).optional().describe('The documents of the collection, when no id was given.'),
+          documents: z.array(documentSchema).optional().describe('The documents of the collection in this page of results, when no id was given.'),
+          total_count: z.number().int().optional().describe('Documents in the collection across all pages of results.'),
+          next_cursor: z.string().optional().describe('Pass as "cursor" to get the next page of documents. Absent on the last one.'),
           document: documentSchema.optional().describe('The document, when an id was given and it exists.'),
           found: z.boolean().optional().describe('When an id was given, whether that document exists.'),
         })
@@ -1392,17 +1397,43 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
 
       if (id === undefined) {
         const docs = await listDocuments(storage, prefix, collection);
-        if (isDbRejection(docs)) return fail(docs.error);
-        const documents = docs.map(toDocumentItem);
-        const text = documents.length
-          ? `${documents.length} document${documents.length === 1 ? '' : 's'} in "${prefix}" / "${collection}"${off}:\n` +
-            JSON.stringify(documents, null, 2)
+        if (isRejection(docs)) return fail(docs.error);
+        let offset = 0;
+        if (args.cursor) {
+          try {
+            const parsed = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf8'));
+            if (typeof parsed?.o !== 'number' || parsed.o < 0) throw new Error('bad cursor');
+            offset = parsed.o;
+          } catch {
+            return fail('cursor is not one this server issued; call read_page_data without a cursor to start over.');
+          }
+        }
+        // Each page of results stays well under the response ceiling, counting both copies of it.
+        const documents: ReturnType<typeof toDocumentItem>[] = [];
+        let budget = DATA_PAGE_BYTES;
+        for (let i = offset; i < docs.length; i++) {
+          const item = toDocumentItem(docs[i]);
+          const size = Buffer.byteLength(JSON.stringify(item), 'utf8');
+          if (documents.length > 0 && size > budget) break;
+          documents.push(item);
+          budget -= size;
+        }
+        const nextOffset = offset + documents.length;
+        const structured: Record<string, unknown> = { prefix, database, collection, documents, total_count: docs.length };
+        if (nextOffset < docs.length) {
+          structured.next_cursor = Buffer.from(JSON.stringify({ o: nextOffset })).toString('base64url');
+        }
+        const text = docs.length
+          ? `${docs.length} document${docs.length === 1 ? '' : 's'} in "${prefix}" / "${collection}"${off}, showing ${offset + 1}-${nextOffset}, ` +
+            'one JSON object per line:\n' +
+            documents.map((d) => JSON.stringify(d)).join('\n') +
+            (structured.next_cursor ? `\nMore documents available: call again with cursor "${structured.next_cursor}".` : '')
           : `Collection "${collection}" of "${prefix}" is empty or does not exist${off}.`;
-        return ok(text, { prefix, database, collection, documents });
+        return ok(text, structured);
       }
 
       const doc = await getDocument(storage, prefix, collection, id);
-      if (isDbRejection(doc)) {
+      if (isRejection(doc)) {
         if (doc.missing) return ok(`No document "${id}" in "${prefix}" / "${collection}"${off}.`, { prefix, database, collection, found: false });
         return fail(doc.error);
       }
@@ -1475,7 +1506,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
 
       if (args.action === 'delete') {
         const result = await deleteDocument(storage, prefix, collection, id as string);
-        if (isDbRejection(result)) return fail(result.error);
+        if (isRejection(result)) return fail(result.error);
         return ok(
           result.deleted
             ? `Deleted "${prefix}" / "${collection}" / "${id}".`
@@ -1492,7 +1523,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         return fail(`"data_json" is not valid JSON: ${(err as Error).message}. Send the value as JSON text, e.g. {"choice": "b"}.`);
       }
       const result = await writeDocument(storage, prefix, collection, args.action, id, data);
-      if (isDbRejection(result)) return fail(result.error);
+      if (isRejection(result)) return fail(result.error);
       const document = toDocumentItem(result.document);
       const verb = args.action === 'add' ? 'Added' : args.action === 'set' ? (result.created ? 'Created' : 'Replaced') : result.created ? 'Created' : 'Updated';
       return ok(`${verb} "${prefix}" / "${collection}" / "${document.id}":\n${JSON.stringify(document.data, null, 2)}`, {

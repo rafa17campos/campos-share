@@ -337,6 +337,7 @@ export async function replaceShare(
   let obsolete: string[] = [];
   // Our own page write, so a retry after a record conflict is conditional on it, not on the version read.
   let pageWritten: string | undefined;
+  let databaseTurnedOn = false;
   const result = await mutateShare(storage, slug, async (existing) => {
     const validated = await validateShareInput(slug, body, storage);
     if (isRejection(validated)) return validated;
@@ -382,6 +383,7 @@ export async function replaceShare(
     // Turning the database off keeps its data; only deleting the page (or making it a folder) removes it.
     const database =
       validated.kind === 'uploaded' && (validated.database !== undefined ? validated.database : Boolean(existing.database));
+    databaseTurnedOn = database && !existing.database;
 
     return {
       slug,
@@ -400,7 +402,7 @@ export async function replaceShare(
   if (obsolete.length > 0) {
     await storage.deleteBlobs(obsolete);
   }
-  if (result.meta.database) await ensurePageDb(storage, slug);
+  if (databaseTurnedOn) await ensurePageDb(storage, slug);
   return pageWritten === undefined ? result : { ...result, pageVersion: contentVersion(pageWritten) };
 }
 

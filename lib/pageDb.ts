@@ -21,7 +21,7 @@
 import crypto from 'node:crypto';
 import { sameSignature, signWithCookieSecret } from './auth.ts';
 import { AssetConflictError, type ShareMeta, type StorageProvider } from './storage.ts';
-import { hasExpired, type ShareInputRejection } from './shareInput.ts';
+import { hasExpired, isRejection, type ShareInputRejection } from './shareInput.ts';
 import { RateLimiter } from './mcp/ratelimit.ts';
 
 export const PAGE_DB_ASSET_NAME = '__db.json';
@@ -46,10 +46,6 @@ export type DbDocument = { id: string; data: unknown; createdAt: string; updated
 export type DbCollection = { name: string; count: number };
 /** A refusal; `missing: "document"` marks the one 404 a client may read as "not there yet". */
 export type DbRejection = ShareInputRejection & { missing?: 'document' };
-
-export function isDbRejection(value: unknown): value is DbRejection {
-  return typeof value === 'object' && value !== null && 'error' in value && 'status' in value;
-}
 
 /* ------------------------------------------------------------------------------------------ */
 /* Access                                                                                      */
@@ -136,6 +132,8 @@ export function pageDbTokenFromRequest(request: Request): string | null {
 
 /** Writes made with a page token, per address and page. Best-effort, per instance (see ratelimit.ts). */
 export const pageDbWriteLimiter = new RateLimiter(60, 60 * 1000);
+/** Reads made with a page token, per address and page: room for a page polling every second or so. */
+export const pageDbReadLimiter = new RateLimiter(120, 60 * 1000);
 
 /* ------------------------------------------------------------------------------------------ */
 /* Names and payloads                                                                          */
@@ -223,7 +221,7 @@ async function mutateDb<T>(
   for (let attempt = 1; ; attempt++) {
     const { db, etag } = await readDb(storage, slug);
     const result = change(db);
-    if (isDbRejection(result)) return result;
+    if (isRejection(result)) return result;
     if (!result.write) return result.value;
     const text = JSON.stringify(db);
     const size = Buffer.byteLength(text, 'utf8');
@@ -243,21 +241,27 @@ async function mutateDb<T>(
       );
       return result.value;
     } catch (err) {
-      if (!(err instanceof AssetConflictError) || attempt >= MUTATION_ATTEMPTS) throw err;
+      if (!(err instanceof AssetConflictError)) throw err;
+      if (attempt >= MUTATION_ATTEMPTS) {
+        return { error: `The database of "${slug}" is busy with other writes; try again`, status: 409 };
+      }
     }
   }
 }
 
-/** Creates an empty store if the page has none yet, so later writes are all conditional on an ETag. */
+/**
+ * Creates an empty store if the page has none yet, so later writes are all conditional on an ETag.
+ * Best-effort: it never fails the caller, because the first write creates the store anyway.
+ */
 export async function ensurePageDb(storage: StorageProvider, slug: string): Promise<void> {
-  const head = await storage.headAsset(slug, PAGE_DB_ASSET_NAME);
-  if (head?.exists) return;
   try {
+    const head = await storage.headAsset(slug, PAGE_DB_ASSET_NAME);
+    if (head?.exists) return;
     await storage.putAsset(slug, PAGE_DB_ASSET_NAME, JSON.stringify(emptyDb()), 'application/json; charset=utf-8', {
       ifAbsent: true,
     });
-  } catch (err) {
-    if (!(err instanceof AssetConflictError)) throw err;
+  } catch {
+    // Created by someone else, or the store hiccupped: mutateDb creates it on the first write.
   }
 }
 
