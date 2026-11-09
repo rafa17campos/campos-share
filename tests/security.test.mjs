@@ -14,7 +14,15 @@ import { GET as handleViewShare } from '../app/[slug]/route.ts';
 import { GET as handleStreamAsset } from '../app/[slug]/[...filename]/route.ts';
 import { POST as handleUnlockShare } from '../app/[slug]/unlock/route.ts';
 import { unlockLimiter } from '../lib/mcp/ratelimit.ts';
-import { signAccessToken, signRefreshToken, verifyAccessToken, verifyRefreshToken } from '../lib/oauth/tokens.ts';
+import {
+  signAccessToken,
+  signCode,
+  signRefreshToken,
+  verifyAccessToken,
+  verifyCode,
+  verifyRefreshToken,
+} from '../lib/oauth/tokens.ts';
+import { listShares } from '../lib/shares.ts';
 import { createShare } from '../lib/shares.ts';
 
 const BASE = 'https://share.example.invalid';
@@ -28,12 +36,25 @@ test('markdown links and images cannot carry a script scheme', () => {
     'java\nscript:alert(1)',
     'data:text/html,<script>alert(1)</script>',
     'vbscript:msgbox(1)',
+    // Character references the browser decodes inside the attribute.
+    'java&#x73;cript:alert(1)',
+    'java&#X73;cript:alert(1)',
+    '&#106;avascript:alert(1)',
+    '&#106avascript:alert(1)',
+    'javascript&colon;alert(1)',
+    'java&Tab;script:alert(1)',
+    '&#0000106;avascript:alert(1)',
   ]) {
     assert.equal(safeHref(bad), '#', JSON.stringify(bad));
   }
   for (const good of ['https://example.com/a?b#c', 'http://x.y', 'mailto:a@b.c', 'tel:+34600000000', '/otra', 'otra/pagina', '#ancla', '?q=1', 'foto.png']) {
     assert.equal(safeHref(good), good);
   }
+  for (const md of ['[a](java&#x73;cript:alert(1))', '[a](&#106;avascript:alert(1))', '[a](javascript&colon;alert(1))', '<javascript:alert(1)>', '[a](<javascript:alert(1)>)']) {
+    const out = renderMarkdown(md);
+    assert.match(out, /href="#"/, `${md} -> ${out}`);
+  }
+  assert.match(renderMarkdown('[q](https://ok.example/?a=1&b=2)'), /href="https:\/\/ok\.example\/\?a=1&amp;b=2"|href="https:\/\/ok\.example\/\?a=1&b=2"/, 'a query string keeps its &');
   const html = renderMarkdown(
     '[a](javascript:alert(1)) ![b](javascript:alert(2)) [c][ref] <https://ok.example> [d](https://ok.example)\n\n[ref]: data:text/html,x'
   );
@@ -114,6 +135,19 @@ test('password guesses are limited per address and share, existing or not', asyn
 
   for (let i = 0; i < 10; i++) await attempt('no-existe', 'x');
   assert.equal((await attempt('no-existe', 'x')).status, 429, 'a slug that does not exist answers the same');
+
+  // With no address to key on, one shared bucket would let anyone lock the share for everyone.
+  unlockLimiter.reset();
+  const anonymous = () =>
+    handleUnlockShare(
+      new Request(`${BASE}/cofre/unlock`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ password: 'mala' }).toString(),
+      }),
+      { params: Promise.resolve({ slug: 'cofre' }) }
+    );
+  for (let i = 0; i < 12; i++) assert.equal((await anonymous()).status, 303);
   unlockLimiter.reset();
 });
 
@@ -121,14 +155,25 @@ test('changing the login passphrase ends every OAuth grant made with the old one
   const input = { client_id: 'dcr.test', sub: 'owner', scope: ['files:read'] };
   const access = await signAccessToken(input);
   const refresh = await signRefreshToken(input);
+  const code = await signCode({
+    client_id: 'dcr.test',
+    client_name: 'Test',
+    redirect_uri: 'https://client.example/cb',
+    scope: ['files:read'],
+    code_challenge: 'x'.repeat(43),
+    resource: `${BASE}/mcp`,
+    sub: 'owner',
+  });
   assert.ok(await verifyAccessToken(access));
   assert.ok(await verifyRefreshToken(refresh));
+  assert.ok(await verifyCode(code));
 
   const original = process.env.MCP_LOGIN_PASSPHRASE_HASH;
   process.env.MCP_LOGIN_PASSPHRASE_HASH = 'scrypt$N=32768$r=8$p=1$cc$dd';
   try {
     assert.equal(await verifyAccessToken(access), null);
     assert.equal(await verifyRefreshToken(refresh), null);
+    assert.equal(await verifyCode(code), null, 'a code minted a moment before the change cannot be exchanged');
     assert.ok(await verifyAccessToken(await signAccessToken(input)), 'grants made after the change work');
   } finally {
     process.env.MCP_LOGIN_PASSPHRASE_HASH = original;
@@ -144,4 +189,14 @@ test('changing the login passphrase ends every OAuth grant made with the old one
     .setExpirationTime(now + 600)
     .sign(new TextEncoder().encode(process.env.MCP_OAUTH_SECRET));
   assert.equal(await verifyAccessToken(legacy), null);
+});
+
+test('listing by prefix reads only the records under it', async () => {
+  const storage = new MemoryStorage();
+  setStorageForTesting(storage);
+  for (const slug of ['viaje-a', 'viaje-b', 'otro']) {
+    await storage.saveMeta(slug, { slug, title: slug, lang: 'es', createdAt: new Date().toISOString(), kind: 'generated', assets: [] });
+  }
+  assert.deepEqual((await listShares(storage, 'viaje')).map((m) => m.slug).sort(), ['viaje-a', 'viaje-b']);
+  assert.equal((await listShares(storage)).length, 3);
 });

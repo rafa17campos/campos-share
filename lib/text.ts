@@ -65,11 +65,25 @@ marked.use({
 
 const SAFE_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
 
-/** `href` if it is relative or uses a scheme in SAFE_SCHEMES, otherwise "#". */
+/**
+ * `href` if it is relative or uses a scheme in SAFE_SCHEMES, otherwise "#".
+ *
+ * The decision is made on what the browser will see, not on the markdown source: marked passes
+ * character references through into the attribute (`java&#x73;cript:` reaches the browser as
+ * `javascript:`), and browsers drop ASCII whitespace and control characters inside a scheme
+ * (`java\tscript:`). Numeric references are decoded here; any other `&` before the path is
+ * refused rather than guessed at, since the named references a browser knows are too many to list.
+ */
 export function safeHref(href: string): string {
-  // Browsers ignore ASCII whitespace and control characters inside a scheme ("java\tscript:").
-  const compact = href.replace(/[\u0000-\u0020\u007f]/g, '');
-  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(compact);
+  const decoded = href
+    .replace(/&#(x[0-9a-f]+|[0-9]+);?/gi, (_, n: string) => {
+      const code = n[0] === 'x' || n[0] === 'X' ? parseInt(n.slice(1), 16) : parseInt(n, 10);
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
+    })
+    .replace(/[\u0000-\u0020\u007f]/g, '');
+  const head = decoded.split(/[/?#]/, 1)[0];
+  if (head.includes('&')) return '#';
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(decoded);
   if (!scheme) return href;
   return SAFE_SCHEMES.has(scheme[1].toLowerCase() + ':') ? href : '#';
 }

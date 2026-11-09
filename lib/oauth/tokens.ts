@@ -48,21 +48,26 @@ export type RefreshPayload = AccessPayload;
 const ALG = 'HS256';
 
 /**
- * A fingerprint of the login passphrase's hash, carried by access and refresh tokens and checked
- * on every use: changing the passphrase (`npm run passphrase:hash`) ends every grant made with the
- * old one, without rotating MCP_OAUTH_SECRET and without storing anything.
+ * A fingerprint of the login passphrase's hash, carried by every artefact signed here (pending
+ * request, code, access and refresh token) and checked on every use: changing the passphrase
+ * (`npm run passphrase:hash`) ends every grant made with the old one, including a code minted a
+ * moment before, without rotating MCP_OAUTH_SECRET and without storing anything. Memoised on the
+ * configured value, so it is computed once per passphrase rather than once per request.
  */
-function passphraseFingerprint(): string {
-  return crypto.createHash('sha256').update(`mcp-login\n${getPassphraseHash()}`).digest('base64url').slice(0, 22);
-}
+let fingerprintCache: { hash: string; fingerprint: string } | null = null;
 
-function grantStillValid(payload: JWTPayload): boolean {
-  return typeof payload.pf === 'string' && payload.pf === passphraseFingerprint();
+function passphraseFingerprint(): string {
+  const hash = getPassphraseHash();
+  if (fingerprintCache?.hash !== hash) {
+    const fingerprint = crypto.createHash('sha256').update(`mcp-login\n${hash}`).digest('base64url').slice(0, 22);
+    fingerprintCache = { hash, fingerprint };
+  }
+  return fingerprintCache.fingerprint;
 }
 
 async function sign(kind: TokenKind, claims: Record<string, unknown>, ttlSeconds: number, audience: string) {
   const now = Math.floor(Date.now() / 1000);
-  return new SignJWT({ ...claims, kind })
+  return new SignJWT({ ...claims, kind, pf: passphraseFingerprint() })
     .setProtectedHeader({ alg: ALG })
     .setIssuer(getIssuer())
     .setAudience(audience)
@@ -80,6 +85,7 @@ async function verify(kind: TokenKind, token: string, audience: string): Promise
       algorithms: [ALG],
     });
     if (payload.kind !== kind) return null;
+    if (payload.pf !== passphraseFingerprint()) return null;
     return payload;
   } catch (err) {
     if (err instanceof joseErrors.JOSEError) return null;
@@ -108,7 +114,7 @@ export async function verifyCode(token: string): Promise<CodePayload | null> {
 export function signAccessToken(input: { client_id: string; sub: string; scope: string[] }): Promise<string> {
   return sign(
     'access',
-    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' '), pf: passphraseFingerprint() },
+    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' ') },
     ACCESS_TOKEN_TTL_SECONDS,
     getResourceUrl()
   );
@@ -117,7 +123,6 @@ export function signAccessToken(input: { client_id: string; sub: string; scope: 
 export async function verifyAccessToken(token: string): Promise<AccessPayload | null> {
   const payload = await verify('access', token, getResourceUrl());
   if (!payload || typeof payload.client_id !== 'string' || typeof payload.sub !== 'string') return null;
-  if (!grantStillValid(payload)) return null;
   return {
     client_id: payload.client_id,
     sub: payload.sub,
@@ -140,7 +145,7 @@ export function signRefreshToken(input: {
   const exp = input.expiresAt ?? now + REFRESH_TOKEN_TTL_SECONDS;
   return sign(
     'refresh',
-    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' '), pf: passphraseFingerprint() },
+    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' ') },
     Math.max(1, exp - now),
     getIssuer()
   );
@@ -149,7 +154,6 @@ export function signRefreshToken(input: {
 export async function verifyRefreshToken(token: string): Promise<RefreshPayload | null> {
   const payload = await verify('refresh', token, getIssuer());
   if (!payload || typeof payload.client_id !== 'string' || typeof payload.sub !== 'string') return null;
-  if (!grantStillValid(payload)) return null;
   return {
     client_id: payload.client_id,
     sub: payload.sub,
