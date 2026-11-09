@@ -53,6 +53,8 @@ export interface ShareMeta {
   assets: ShareAsset[];
   expiresAt?: string | null;
   passwordHash?: string | null;
+  /** An uploaded page that keeps a shared data store at `<slug>/__db.json` (see lib/pageDb.ts). */
+  database?: boolean;
 }
 
 export interface UploadRequestFile {
@@ -137,6 +139,8 @@ export class AssetConflictError extends Error {
 export interface PutAssetOptions {
   /** Write only if the file still carries this ETag; otherwise throw `AssetConflictError`. */
   ifMatch?: string;
+  /** Write only if no file exists at that name yet; otherwise throw `AssetConflictError`. */
+  ifAbsent?: boolean;
 }
 
 export interface MetaRead {
@@ -242,7 +246,7 @@ export class VercelBlobStorage implements StorageProvider {
         access: BLOB_ACCESS,
         contentType,
         addRandomSuffix: false,
-        allowOverwrite: true,
+        allowOverwrite: !options.ifAbsent,
         cacheControlMaxAge: BLOB_CACHE_MAX_AGE_SECONDS,
         token: this.token,
         ...(options.ifMatch ? { ifMatch: options.ifMatch } : {}),
@@ -250,6 +254,12 @@ export class VercelBlobStorage implements StorageProvider {
     } catch (err: unknown) {
       if (err instanceof BlobPreconditionFailedError || (err as { name?: string })?.name === 'BlobPreconditionFailedError') {
         throw new AssetConflictError(slug, filename);
+      }
+      // Blob has no dedicated error for a create-only put onto an existing pathname (the SDK reports
+      // it as an unknown error), so ask the store: if the file exists now, somebody else created it.
+      if (options.ifAbsent) {
+        const now = await this.headAsset(slug, filename).catch(() => null);
+        if (now?.exists) throw new AssetConflictError(slug, filename);
       }
       throw err;
     }
@@ -520,6 +530,9 @@ export class MemoryStorage implements StorageProvider {
     if (options.ifMatch) {
       const current = this.blobs.get(`${slug}/${filename}`);
       if (!current || memoryEtag(current.data) !== options.ifMatch) throw new AssetConflictError(slug, filename);
+    }
+    if (options.ifAbsent && this.blobs.has(`${slug}/${filename}`)) {
+      throw new AssetConflictError(slug, filename);
     }
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
     this.blobs.set(`${slug}/${filename}`, {

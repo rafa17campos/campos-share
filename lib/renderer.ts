@@ -466,7 +466,56 @@ export function renderSharePage(
 /**
  * Injects missing mandatory head tags into uploaded HTML files
  */
-export function injectUploadedHtml(rawHtml: string, meta: ShareMeta): string {
+/** A value as a JavaScript literal that is safe inside an inline <script>. */
+function scriptLiteral(value: string): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
+/**
+ * The client a page with a database gets as `window.shareDb`. It talks to `/api/db/<slug>` with the
+ * page token, from the sandboxed page's opaque origin (`Origin: null`), so no cookie is involved.
+ * Every method returns a promise; a failure rejects with an Error carrying the HTTP `status`.
+ */
+export function renderPageDbClient(endpoint: string, token: string): string {
+  return `<script>
+(function () {
+  var E = ${scriptLiteral(endpoint)}, T = ${scriptLiteral(token)};
+  function seg(s) { return '/' + encodeURIComponent(String(s)); }
+  function call(method, path, data, nullIfMissing) {
+    var headers = { Authorization: 'Bearer ' + T };
+    var init = { method: method, headers: headers };
+    if (data !== undefined) { headers['Content-Type'] = 'application/json'; init.body = JSON.stringify({ data: data }); }
+    return fetch(E + path, init).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (r.ok) return j;
+        if (nullIfMissing && r.status === 404 && j && j.missing === 'document') return null;
+        var e = new Error((j && j.error) || ('shareDb: HTTP ' + r.status));
+        e.status = r.status;
+        throw e;
+      });
+    });
+  }
+  var api = {
+    collections: function () { return call('GET', '').then(function (j) { return j.collections; }); },
+    list: function (c) { return call('GET', seg(c)).then(function (j) { return j.documents; }); },
+    get: function (c, id) { return call('GET', seg(c) + seg(id), undefined, true); },
+    add: function (c, data) { return call('POST', seg(c), data); },
+    set: function (c, id, data) { return call('PUT', seg(c) + seg(id), data); },
+    update: function (c, id, data) { return call('PATCH', seg(c) + seg(id), data); },
+    remove: function (c, id) { return call('DELETE', seg(c) + seg(id)).then(function (j) { return j.deleted; }); }
+  };
+  try { Object.defineProperty(window, 'shareDb', { value: Object.freeze(api), enumerable: true }); }
+  catch (e) { window.shareDb = api; }
+})();
+</script>`;
+}
+
+export type UploadedHtmlOptions = {
+  /** Inject `window.shareDb` for a page with a database. */
+  pageDb?: { endpoint: string; token: string };
+};
+
+export function injectUploadedHtml(rawHtml: string, meta: ShareMeta, options: UploadedHtmlOptions = {}): string {
   let html = rawHtml;
 
   // Ensure <html lang="...">
@@ -510,6 +559,11 @@ export function injectUploadedHtml(rawHtml: string, meta: ShareMeta): string {
   }
   if (!/<meta\b[^>]*property=["']og:type["']/i.test(html)) {
     headInjections.push('<meta property="og:type" content="website">');
+  }
+
+  // First in <head>, so the page's own scripts find window.shareDb already there.
+  if (options.pageDb) {
+    headInjections.unshift(renderPageDbClient(options.pageDb.endpoint, options.pageDb.token));
   }
 
   if (headInjections.length > 0) {

@@ -26,6 +26,7 @@ export type ShareInputBody = {
   html?: unknown;
   expiresAt?: unknown;
   password?: unknown;
+  database?: unknown;
   assets?: Array<{ name?: string; originalName?: string; contentType?: string; sha256?: string }>;
 };
 
@@ -53,6 +54,8 @@ export type ShareInputAccepted = {
   expiresAt?: string | null;
   /** Absent means "leave it as it is"; null removes the password; a string sets one. */
   password?: string | null;
+  /** Absent means "leave it as it is" (off for a new share); only a page can turn it on. */
+  database?: boolean;
 };
 
 /**
@@ -114,6 +117,11 @@ export async function validateShareInput(
   const secret = readPassword(body.password);
   if ('error' in secret) return secret;
 
+  if (body.database !== undefined && typeof body.database !== 'boolean') {
+    return { error: 'Field "database" must be true, false, or omitted', status: 400 };
+  }
+  const database = body.database as boolean | undefined;
+
   if (!title || typeof title !== 'string' || !title.trim()) {
     return { error: 'Field "title" is required and must be non-empty', status: 400 };
   }
@@ -152,11 +160,15 @@ export async function validateShareInput(
       assets: [],
       expiresAt: expiry.value,
       password: secret.value,
+      ...(database !== undefined ? { database } : {}),
     };
   }
 
   if (html) {
     return { error: 'For kind "generated", "html" field must be null or omitted', status: 400 };
+  }
+  if (database) {
+    return { error: 'Only a page (kind "uploaded") can have a database', status: 400 };
   }
   if (!Array.isArray(assets) || assets.length === 0) {
     return { error: 'For kind "generated", at least one asset is required', status: 400 };

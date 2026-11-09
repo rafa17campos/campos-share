@@ -15,6 +15,7 @@ A lightweight Next.js service on Vercel backed by Vercel Blob, serving standalon
     ```text
     <slug>/__meta.json
     <slug>/__page.html       (for kind: "uploaded")
+    <slug>/__db.json         (for a page with "database": true; see "Page database")
     <slug>/<asset-filename>
     ```
   * `__meta.json` is the sole source of truth. Link expiry is a timestamp comparison at read time; password protection is a cryptographic hash comparison at read time.
@@ -44,7 +45,7 @@ A lightweight Next.js service on Vercel backed by Vercel Blob, serving standalon
 
 ## API Contract (`/api/*`)
 
-All `/api/*` routes require `Authorization: Bearer <SHARE_API_TOKEN>`. Token validation uses constant-time comparison (`crypto.timingSafeEqual`).
+All `/api/*` routes require `Authorization: Bearer <SHARE_API_TOKEN>`. Token validation uses constant-time comparison (`crypto.timingSafeEqual`). The one exception is `/api/db/*` (section 11), which also accepts the page token a page with a database carries.
 
 ### 1. `POST /api/uploads`
 Issues a scoped Blob client upload token before files move.
@@ -92,6 +93,7 @@ Creates a share record after assets have been uploaded to Blob.
   }
   ```
   * For `kind: "uploaded"`, set `html` to the inline HTML string and omit assets.
+  * For `kind: "uploaded"`, `"database": true` gives the page a shared database (section 11). A folder cannot have one (`400`). On `PUT /api/shares/{slug}`, omitting `database` keeps the stored value; `false` turns it off and keeps the data; turning a page into a folder deletes it.
 * **Response (`201 Created`)**:
   ```json
   {
@@ -155,6 +157,39 @@ Sweeps and deletes `<slug>/` prefixes older than 24 hours that contain uploaded 
 
 ---
 
+### 11. Page database: `/api/db/{slug}[/{collection}[/{id}]]`
+A page published with `"database": true` keeps a small JSON store shared by everyone who opens it, the way a Claude artifact can: a poll, a sign-up sheet, a checklist, a guest book. It is one blob, `<slug>/__db.json`, next to the page; no database server. The page's scripts reach it through `window.shareDb`, injected first in its `<head>`:
+
+```js
+await shareDb.collections()                  // [{ name, count }]
+await shareDb.list('votos')                  // [{ id, data, createdAt, updatedAt }], oldest first
+await shareDb.get('votos', 'ana')            // the document, or null
+await shareDb.add('votos', { choice: 'b' })  // the document, with a new random id
+await shareDb.set('votos', 'ana', { choice: 'a' })   // create or replace
+await shareDb.update('votos', 'ana', { nota: 'x' })  // shallow-merge an object
+await shareDb.remove('votos', 'ana')         // whether it existed
+```
+
+Failures reject with an `Error` carrying the HTTP `status`. There are no live updates (poll `list`) and no per-visitor identity.
+
+| Method | Path | Does |
+|---|---|---|
+| `GET` | `/api/db/{slug}` | `{ collections: [{ name, count }] }` |
+| `GET` | `/api/db/{slug}/{collection}` | `{ collection, documents: [...] }`, oldest first |
+| `GET` | `/api/db/{slug}/{collection}/{id}` | One document; `404` with `"missing": "document"` if absent |
+| `POST` | `/api/db/{slug}/{collection}` | Add `{"data": …}` under a random id → `201` |
+| `PUT` | `/api/db/{slug}/{collection}/{id}` | Set (create `201` or replace `200`) |
+| `PATCH` | `/api/db/{slug}/{collection}/{id}` | Shallow-merge an object into the document, creating it if absent |
+| `DELETE` | `/api/db/{slug}/{collection}/{id}` | `{ deleted: true\|false }` |
+| `DELETE` | `/api/db/{slug}/{collection}` | Delete the whole collection (owner only) → `{ deleted: <count> }` |
+
+Documents are `{ id, data, createdAt, updatedAt }`; `data` is any JSON value. Collection names match `^[a-z0-9][a-z0-9_-]{0,63}$`, ids `^[A-Za-z0-9_-]{1,128}$` not starting with `__`.
+
+* **Who can call.** The owner, with `SHARE_API_TOKEN`: reads always (also on an expired page, or one whose database was turned off, whose data is kept), writes while the database is on. The page, with a **page token**: an HMAC with `SHARE_COOKIE_SECRET` over the slug, the day it was issued and a fingerprint of the page's creation time and password hash, handed out only inside the page itself (after the expiry check and the password gate) and valid for 8 days. Setting or changing the password, or deleting and recreating the page, invalidates every earlier token (`401`, "reload the page"). Expiry and the `database` flag are checked on every request (`404` for a page token once either says no). Anyone who can open the page can write its data, as with an artifact.
+* **CORS.** Uploaded pages are sandboxed (opaque origin, `Origin: null`, no cookies), so the API answers `Access-Control-Allow-Origin: *` without credentials and handles the `OPTIONS` preflight.
+* **Concurrency.** Every write reads the blob with its ETag and writes it back with `ifMatch`, retrying on conflict; writes to one page serialise.
+* **Limits.** 64 KB per document and 1 MB per page (`413`), 50 collections and 5000 documents per collection (`409`). Requests with a page token are rate limited before any storage is read: 60 writes and 120 reads per minute per address and page, and 300 requests per minute per address across pages (`429` with `Retry-After`), best-effort per instance. A write's body is read before the page is checked, so a page deleted, recreated, expired or switched off while the body was arriving refuses the write.
+
 ## MCP server
 
 The service exposes its files as tools to any MCP client at:
@@ -177,12 +212,14 @@ A **page** is the other kind of share (`kind: "uploaded"`): one HTML document se
 | `update_file` | Replaces the content of an existing file (inline, up to **3 MB** decoded) and keeps its URL. With the `version` from `read_file` it refuses to overwrite a change made since that read. | `files:write` | **destructive**, idempotent |
 | `create_upload_url` | Returns a presigned `PUT` URL (15 min, bound to content type and size) for files up to **20 MB**, plus the URL the file will have. For large files and for clients that can run `curl`. `overwrite: true` replaces an existing file in place. | `files:write` | writes |
 | `complete_upload` | Publishes a file uploaded through `create_upload_url`, or refreshes its record after an overwrite. Idempotent. | `files:write` | idempotent |
-| `publish_page` | Publishes an HTML document (inline, up to **3 MB**) as a page at `$SHARE_BASE_URL/<prefix>`, optionally behind a `password` (at least 8 characters, no leading or trailing whitespace) and with a future `expires_at`. Never overwrites. | `files:write` | writes |
-| `update_page` | Replaces the document of an existing page and keeps its URL. Title, description, language, expiry (`expires_at`, empty string to remove) and `password` (empty string to remove) keep their stored value unless restated; an expired page is refused until `expires_at` is given. With the `version` from `read_file` it refuses to overwrite a change made since that read. | `files:write` | **destructive**, idempotent |
+| `publish_page` | Publishes an HTML document (inline, up to **3 MB**) as a page at `$SHARE_BASE_URL/<prefix>`, optionally behind a `password` (at least 8 characters, no leading or trailing whitespace) and with a future `expires_at`. `database: true` gives it a shared database (`window.shareDb`, section 11). Never overwrites. | `files:write` | writes |
+| `update_page` | Replaces the document of an existing page and keeps its URL. Title, description, language, expiry (`expires_at`, empty string to remove) `password` (empty string to remove) and `database` (`false` turns it off and keeps the data) keep their stored value unless restated; an expired page is refused until `expires_at` is given. With the `version` from `read_file` it refuses to overwrite a change made since that read. | `files:write` | **destructive**, idempotent |
 | `list_files` | Name, size, date and URL of every file, optionally under a prefix, 50 per page with a cursor, plus every page matching the prefix (not paginated). | `files:read` | read-only |
 | `get_file_info` | Details of one file, one folder or one page. | `files:read` | read-only |
 | `read_file` | Content of one file, or the HTML of one page, straight from storage (so also when it is password-protected, expired, or the client cannot reach the public URL), up to **3 MB**: UTF-8 text for text types, base64 otherwise. Returns the `version` that `update_page` and `update_file` take. | `files:read` | read-only |
 | `delete_file` | Deletes a file, a whole folder, or a page (by its prefix). Deleting the last file deletes its folder. | `files:delete` | **destructive** |
+| `read_page_data` | The shared database of a page (`database: true` on `publish_page`/`update_page`): its collections, every document of one collection, or one document. Works on protected and expired pages and on a database turned off. | `files:read` | read-only |
+| `write_page_data` | Changes one document of a page's database: `add`, `set`, `update` (shallow merge) or `delete`, with the value as JSON text in `data_json`. `delete` needs `files:delete`. | `files:write` | **destructive** |
 
 Every tool returns readable text and the same data as `structuredContent` with an `outputSchema`, so clients that use either work. The exception is `read_file`, which returns text alone: a header block (`path`, `type`, `content_type`, `encoding`, `size_bytes`, `version`, `url`, one `key: value` per line) and then the content. A host that sees `structuredContent` reads only that, so returning both would mean sending the file twice under a response that Vercel caps at 4.5 MB.
 

@@ -199,6 +199,21 @@ export function verifyUnlockCookieValue(
 }
 
 /**
+ * HMAC-SHA256 of `payload` with SHARE_COOKIE_SECRET, as hex. For tokens that, like the unlock
+ * cookie, only this service issues and checks (the page database token in lib/pageDb.ts).
+ * Throws immediately if SHARE_COOKIE_SECRET is missing.
+ */
+export function signWithCookieSecret(payload: string): string {
+  return crypto.createHmac('sha256', getCookieSecret()).update(payload).digest('hex');
+}
+
+/** Constant-time equality of two hex signatures of the same length. */
+export function sameSignature(a: string, b: string): boolean {
+  if (!/^[0-9a-f]+$/i.test(a) || !/^[0-9a-f]+$/i.test(b) || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
+}
+
+/**
  * Helper to extract the unlock cookie for a specific slug from Cookie header
  */
 export function getUnlockCookieFromRequest(request: Request, slug: string): string | null {

@@ -46,6 +46,7 @@ export async function POST(request: Request) {
       url: detail.url,
       createdAt: detail.createdAt,
       assets: detail.assets,
+      database: detail.hasDatabase,
     },
     201
   );

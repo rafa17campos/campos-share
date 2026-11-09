@@ -4,6 +4,7 @@ import { getStorage } from '../../lib/storage.ts';
 import { isInlineText } from '../../lib/text.ts';
 import { getBaseUrl } from '../../lib/config.ts';
 import { PAGE_ASSET_NAME } from '../../lib/shares.ts';
+import { issuePageDbToken } from '../../lib/pageDb.ts';
 import {
   renderSharePage,
   injectUploadedHtml,
@@ -129,7 +130,11 @@ export async function GET(
     if (htmlAsset) {
       const response = new Response(htmlAsset.stream);
       const rawHtml = await response.text();
-      contentHtml = injectUploadedHtml(rawHtml, meta);
+      // The page token is handed out here and only here: after the expiry check and the password gate.
+      const pageDb = meta.database
+        ? { endpoint: `${baseUrl}/api/db/${slug}`, token: issuePageDbToken(meta) }
+        : undefined;
+      contentHtml = injectUploadedHtml(rawHtml, meta, { pageDb });
       sandboxPolicy = UPLOADED_PAGE_SANDBOX;
     } else {
       contentHtml = renderSharePage(meta, baseUrl, await readInlineText(storage, meta));
