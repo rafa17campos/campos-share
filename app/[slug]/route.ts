@@ -11,6 +11,7 @@ import {
 } from '../../lib/renderer.ts';
 import {
   verifyUnlockCookieValue,
+  unlockBinding,
   getUnlockCookieFromRequest,
 } from '../../lib/auth.ts';
 
@@ -87,7 +88,7 @@ export async function GET(
   const isProtected = Boolean(meta.passwordHash);
   if (isProtected) {
     const cookieValue = getUnlockCookieFromRequest(request, slug);
-    const isUnlocked = verifyUnlockCookieValue(cookieValue, slug);
+    const isUnlocked = verifyUnlockCookieValue(cookieValue, slug, unlockBinding(meta));
 
     if (!isUnlocked) {
       const url = new URL(request.url);
