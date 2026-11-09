@@ -8,6 +8,18 @@ import {
 
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
+/**
+ * Types a browser runs script in when opened directly. Such a file is content we did not write,
+ * like an uploaded page, so it gets the same sandbox: an opaque origin, no cookies, no reach into
+ * other shares. Everything else (images, PDFs, media, downloads) is served as is.
+ */
+const SCRIPTABLE_TYPES = ['text/html', 'application/xhtml+xml', 'image/svg+xml', 'text/xml', 'application/xml', 'text/xsl'];
+
+function isScriptable(contentType: string): boolean {
+  const type = contentType.split(';')[0].trim().toLowerCase();
+  return SCRIPTABLE_TYPES.includes(type) || type.endsWith('+xml');
+}
+
 function notFound(): Response {
   return new Response('Not Found', {
     status: 404,
@@ -98,6 +110,9 @@ export async function GET(
     'X-Content-Type-Options': 'nosniff',
     ETag: asset.etag,
   };
+  if (isScriptable(declared)) {
+    headers['Content-Security-Policy'] = 'sandbox allow-scripts';
+  }
 
   if (asset.notModified || !asset.stream) {
     return new Response(null, { status: 304, headers });

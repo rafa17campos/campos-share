@@ -17,6 +17,7 @@ import {
   REFRESH_TOKEN_TTL_SECONDS,
   getIssuer,
   getOAuthSecret,
+  getPassphraseHash,
   getResourceUrl,
 } from '../mcp/config.ts';
 
@@ -45,6 +46,19 @@ export type AccessPayload = {
 export type RefreshPayload = AccessPayload;
 
 const ALG = 'HS256';
+
+/**
+ * A fingerprint of the login passphrase's hash, carried by access and refresh tokens and checked
+ * on every use: changing the passphrase (`npm run passphrase:hash`) ends every grant made with the
+ * old one, without rotating MCP_OAUTH_SECRET and without storing anything.
+ */
+function passphraseFingerprint(): string {
+  return crypto.createHash('sha256').update(`mcp-login\n${getPassphraseHash()}`).digest('base64url').slice(0, 22);
+}
+
+function grantStillValid(payload: JWTPayload): boolean {
+  return typeof payload.pf === 'string' && payload.pf === passphraseFingerprint();
+}
 
 async function sign(kind: TokenKind, claims: Record<string, unknown>, ttlSeconds: number, audience: string) {
   const now = Math.floor(Date.now() / 1000);
@@ -94,7 +108,7 @@ export async function verifyCode(token: string): Promise<CodePayload | null> {
 export function signAccessToken(input: { client_id: string; sub: string; scope: string[] }): Promise<string> {
   return sign(
     'access',
-    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' ') },
+    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' '), pf: passphraseFingerprint() },
     ACCESS_TOKEN_TTL_SECONDS,
     getResourceUrl()
   );
@@ -103,6 +117,7 @@ export function signAccessToken(input: { client_id: string; sub: string; scope: 
 export async function verifyAccessToken(token: string): Promise<AccessPayload | null> {
   const payload = await verify('access', token, getResourceUrl());
   if (!payload || typeof payload.client_id !== 'string' || typeof payload.sub !== 'string') return null;
+  if (!grantStillValid(payload)) return null;
   return {
     client_id: payload.client_id,
     sub: payload.sub,
@@ -125,7 +140,7 @@ export function signRefreshToken(input: {
   const exp = input.expiresAt ?? now + REFRESH_TOKEN_TTL_SECONDS;
   return sign(
     'refresh',
-    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' ') },
+    { client_id: input.client_id, sub: input.sub, scope: input.scope.join(' '), pf: passphraseFingerprint() },
     Math.max(1, exp - now),
     getIssuer()
   );
@@ -134,6 +149,7 @@ export function signRefreshToken(input: {
 export async function verifyRefreshToken(token: string): Promise<RefreshPayload | null> {
   const payload = await verify('refresh', token, getIssuer());
   if (!payload || typeof payload.client_id !== 'string' || typeof payload.sub !== 'string') return null;
+  if (!grantStillValid(payload)) return null;
   return {
     client_id: payload.client_id,
     sub: payload.sub,

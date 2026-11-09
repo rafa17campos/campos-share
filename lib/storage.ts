@@ -426,7 +426,7 @@ export class VercelBlobStorage implements StorageProvider {
       const batchResults = await Promise.all(
         batch.map(async (item) => {
           try {
-            const res = await get(item.pathname, { access: BLOB_ACCESS, token: this.token });
+            const res = await get(item.pathname, { access: BLOB_ACCESS, token: this.token, useCache: false });
             if (!res || res.statusCode !== 200 || !res.stream) return null;
             const text = await new Response(res.stream).text();
             return JSON.parse(text) as ShareMeta;

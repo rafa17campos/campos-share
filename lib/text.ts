@@ -53,7 +53,26 @@ marked.use({
   renderer: {
     html: () => '',
   },
+  // A share page is not sandboxed, so a link or image is limited to schemes that cannot run code:
+  // `javascript:` would run on this origin, next to every other share, and `data:` / `vbscript:`
+  // and the rest have no business in a note. Anything else becomes an inert "#".
+  walkTokens(token) {
+    if (token.type === 'link' || token.type === 'image') {
+      token.href = safeHref(token.href);
+    }
+  },
 });
+
+const SAFE_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
+
+/** `href` if it is relative or uses a scheme in SAFE_SCHEMES, otherwise "#". */
+export function safeHref(href: string): string {
+  // Browsers ignore ASCII whitespace and control characters inside a scheme ("java\tscript:").
+  const compact = href.replace(/[\u0000-\u0020\u007f]/g, '');
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(compact);
+  if (!scheme) return href;
+  return SAFE_SCHEMES.has(scheme[1].toLowerCase() + ':') ? href : '#';
+}
 
 function extensionOf(name: string): string {
   const bare = name.split('/').pop() ?? name;
