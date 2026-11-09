@@ -20,6 +20,7 @@ import {
 } from './storage.ts';
 import crypto from 'node:crypto';
 import { hashPassword } from './auth.ts';
+import { PAGE_DB_ASSET_NAME, ensurePageDb } from './pageDb.ts';
 import { getBaseUrl } from './config.ts';
 import {
   SLUG_REGEX,
@@ -109,6 +110,8 @@ export type ShareSummary = {
   expiresAt: string | null;
   isExpired: boolean;
   isPasswordProtected: boolean;
+  /** Whether the page keeps a shared database (always false for a folder). */
+  hasDatabase: boolean;
 };
 
 export type ShareDetail = ShareSummary & { assets: AssetView[] };
@@ -128,6 +131,7 @@ export function toShareSummary(meta: ShareMeta): ShareSummary {
     expiresAt: meta.expiresAt || null,
     isExpired: hasExpired(meta.expiresAt),
     isPasswordProtected: Boolean(meta.passwordHash),
+    hasDatabase: Boolean(meta.database),
   };
 }
 
@@ -310,8 +314,10 @@ export async function createShare(
     assets: validated.assets,
     expiresAt: validated.expiresAt || null,
     passwordHash,
+    ...(validated.database ? { database: true } : {}),
   };
   await storage.saveMeta(slug, meta);
+  if (meta.database) await ensurePageDb(storage, slug);
   return { meta, created: true };
 }
 
@@ -344,7 +350,8 @@ export async function replaceShare(
     const keep = new Set(validated.assets.map((a) => a.name));
     obsolete = existing.assets.filter((a) => !keep.has(a.name)).map((a) => `${slug}/${a.name}`);
     if (existing.kind === 'uploaded' && validated.kind !== 'uploaded') {
-      obsolete.push(`${slug}/${PAGE_ASSET_NAME}`);
+      // A folder has no page and no database: both go with the page they belonged to.
+      obsolete.push(`${slug}/${PAGE_ASSET_NAME}`, `${slug}/${PAGE_DB_ASSET_NAME}`);
     }
 
     if (validated.kind === 'uploaded' && validated.html) {
@@ -372,6 +379,10 @@ export async function replaceShare(
       passwordHash = validated.password ? await hashPassword(validated.password) : null;
     }
 
+    // Turning the database off keeps its data; only deleting the page (or making it a folder) removes it.
+    const database =
+      validated.kind === 'uploaded' && (validated.database !== undefined ? validated.database : Boolean(existing.database));
+
     return {
       slug,
       title: validated.title,
@@ -382,12 +393,14 @@ export async function replaceShare(
       assets: validated.assets,
       expiresAt: validated.expiresAt !== undefined ? validated.expiresAt : existing.expiresAt,
       passwordHash,
+      ...(database ? { database: true } : {}),
     };
   });
   if (isRejection(result)) return result;
   if (obsolete.length > 0) {
     await storage.deleteBlobs(obsolete);
   }
+  if (result.meta.database) await ensurePageDb(storage, slug);
   return pageWritten === undefined ? result : { ...result, pageVersion: contentVersion(pageWritten) };
 }
 

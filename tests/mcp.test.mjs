@@ -98,7 +98,7 @@ function walk(node, visit, path = '') {
   }
 }
 
-test('tools/list advertises the ten tools with least-common-denominator schemas and annotations', async () => {
+test('tools/list advertises the twelve tools with least-common-denominator schemas and annotations', async () => {
   fresh();
   const client = await connect(STATIC_TOKEN);
   const { tools } = await client.listTools();
@@ -114,9 +114,11 @@ test('tools/list advertises the ten tools with least-common-denominator schemas 
       'list_files',
       'publish_page',
       'read_file',
+      'read_page_data',
       'update_file',
       'update_page',
       'upload_file',
+      'write_page_data',
     ]
   );
 
@@ -166,6 +168,13 @@ test('tools/list advertises the ten tools with least-common-denominator schemas 
   assert.deepEqual(byName.update_page.inputSchema.required, ['prefix', 'html']);
   assert.deepEqual(byName.upload_file.inputSchema.required, ['filename', 'content', 'encoding']);
   assert.deepEqual(byName.upload_file.inputSchema.properties.encoding.enum, ['text', 'base64']);
+  assert.equal(byName.read_page_data.annotations.readOnlyHint, true);
+  assert.equal(byName.write_page_data.annotations.destructiveHint, true);
+  assert.deepEqual(byName.read_page_data.inputSchema.required, ['prefix']);
+  assert.deepEqual(byName.write_page_data.inputSchema.required, ['prefix', 'collection', 'action']);
+  assert.deepEqual(byName.write_page_data.inputSchema.properties.action.enum, ['add', 'set', 'update', 'delete']);
+  assert.equal(byName.publish_page.inputSchema.properties.database.type, 'boolean');
+  assert.equal(byName.update_page.inputSchema.properties.database.type, 'boolean');
 });
 
 test('a request without a token gets 401 with a resource_metadata challenge and CORS headers', async () => {

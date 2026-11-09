@@ -45,6 +45,7 @@ The same shares are exposed as MCP tools at `$SHARE_BASE_URL/mcp` (see README, "
 * **Blob Storage Only (Zero Database)**:
   * Strict standing constraint: No database (no Postgres, SQLite, Redis, or ORM).
   * Storage is partitioned in Blob under `<slug>/__meta.json` and `<slug>/<filename>`.
+  * A page's database (`database: true`) is one more blob, `<slug>/__db.json`, not a database server. It is read and changed only through `lib/pageDb.ts`, by both the `/api/db` routes and the MCP tools, with the same read-ETag / write-`ifMatch` / retry rule as the record. Its page token is handed out only by `app/[slug]/route.ts`, after the expiry check and the password gate.
   * `__meta.json` is the sole source of truth. Link expiry is a date comparison at read time; password protection is a constant-time scrypt hash comparison at read time.
   * Adding a feature that requires a database requires reopening this architectural decision first.
 * **Record writes are conditional**:

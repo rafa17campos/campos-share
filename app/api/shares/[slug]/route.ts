@@ -74,6 +74,7 @@ export async function PUT(
       assets: detail.assets,
       isPasswordProtected: detail.isPasswordProtected,
       expiresAt: detail.expiresAt,
+      database: detail.hasDatabase,
     },
     200
   );

@@ -37,6 +37,17 @@ import {
 } from '../shares.ts';
 import { MAX_INLINE_BYTES, SCOPE_DELETE, SCOPE_READ, SCOPE_WRITE, getDefaultLang } from './config.ts';
 import { lcd, mimeFromFilename } from './schema.ts';
+import {
+  DB_LIMITS,
+  checkDbAccess,
+  deleteDocument,
+  getDocument,
+  isDbRejection,
+  listCollections,
+  listDocuments,
+  writeDocument,
+  type DbDocument,
+} from '../pageDb.ts';
 
 export type ToolDeps = { storage: StorageProvider };
 
@@ -186,6 +197,7 @@ function readPasswordArg(raw: string | undefined, emptyMeans: string): string | 
 function describeAccess(meta: ShareMeta): string {
   const parts = [meta.passwordHash ? 'password protected' : 'no password'];
   parts.push(meta.expiresAt ? `expires ${meta.expiresAt}` : 'no expiry');
+  if (meta.database) parts.push('with a database');
   return parts.join(', ');
 }
 
@@ -681,8 +693,10 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         `${MAX_INLINE_BYTES / (1024 * 1024)} MB; a missing lang attribute, title, description, viewport or robots ` +
         'tag is added to its <head> when it is served. A prefix that is already taken is rejected, never ' +
         'overwritten: use update_page to replace the content of a page that exists. Pass "password" to make ' +
-        'visitors enter one before they see it, and "expires_at" to stop serving it at a date. For an HTML file that should ' +
-        'sit in a folder alongside other files, use upload_file instead.',
+        'visitors enter one before they see it, and "expires_at" to stop serving it at a date. Pass "database": true ' +
+        'to give the page a small data store shared by every visitor (a poll, a sign-up sheet, a checklist): the page ' +
+        'reads and writes it through window.shareDb (see the "database" field), and you through read_page_data and ' +
+        'write_page_data. For an HTML file that should sit in a folder alongside other files, use upload_file instead.',
       inputSchema: lcd(
         z.object({
           prefix: z
@@ -714,6 +728,19 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             .string()
             .optional()
             .describe('When the page stops being served, a future ISO 8601 date. Omit it for a page with no expiry.'),
+          database: z
+            .boolean()
+            .optional()
+            .describe(
+              'Give the page a shared database. Its scripts then find window.shareDb, whose methods return promises: ' +
+                'collections() -> [{name, count}]; list(collection) -> [{id, data, createdAt, updatedAt}] oldest first; ' +
+                'get(collection, id) -> document or null; add(collection, data) -> document with a new id; ' +
+                'set(collection, id, data) creates or replaces; update(collection, id, object) shallow-merges; ' +
+                'remove(collection, id) -> whether it existed. data is any JSON value. Collection names: lowercase ' +
+                'letters, digits, "_" and "-"; ids: letters, digits, "_" and "-". Every visitor shares the same data; ' +
+                'there are no live updates (poll list() to refresh) and no per-visitor identity. Limits: ' +
+                `${DB_LIMITS.documentBytes / 1024} KB per document, ${DB_LIMITS.storeBytes / (1024 * 1024)} MB per page.`
+            ),
         })
       ),
       outputSchema: lcd(
@@ -726,6 +753,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           created_at: z.string().describe('When the page was published, ISO 8601.'),
           expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
           password_protected: z.boolean().describe('Whether visitors need a password to open the page.'),
+          database: z.boolean().describe('Whether the page has a shared database (window.shareDb).'),
         })
       ),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -763,6 +791,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         html,
         ...(publishExpiresAt ? { expiresAt: publishExpiresAt } : {}),
         ...(publishPassword ? { password: publishPassword } : {}),
+        ...(args.database ? { database: true } : {}),
       });
       if (isRejection(result)) return failRejection(result);
 
@@ -775,6 +804,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         created_at: result.meta.createdAt,
         expires_at: result.meta.expiresAt ?? undefined,
         password_protected: Boolean(result.meta.passwordHash),
+        database: Boolean(result.meta.database),
       };
       return ok(
         `Published the page "${structured.title}" (${formatBytes(structured.size_bytes)} of HTML; ${describeAccess(result.meta)}).\nPage URL: ${structured.url}`,
@@ -822,6 +852,13 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
                 'leading or trailing whitespace; an empty string removes the password. Defaults to the ' +
                 'one the page already has.'
             ),
+          database: z
+            .boolean()
+            .optional()
+            .describe(
+              'true gives the page a shared database (window.shareDb; see publish_page), false turns it off. Turning it ' +
+                'off keeps its data, and turning it back on brings it back. Defaults to what the page already has.'
+            ),
           version: versionInput,
         })
       ),
@@ -836,6 +873,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           updated_at: z.string().describe('When the replacement happened, ISO 8601.'),
           expires_at: z.string().optional().describe('When the page stops being served, if an expiry is set.'),
           password_protected: z.boolean().describe('Whether visitors need a password to open the page after this call.'),
+          database: z.boolean().describe('Whether the page has a shared database after this call.'),
           version: z.string().describe('Version of the new document; pass it to the next update_page to chain edits without reading again.'),
         })
       ),
@@ -881,6 +919,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         html,
         ...(expiresAt !== undefined ? { expiresAt } : {}),
         ...(password !== undefined ? { password } : {}),
+        ...(args.database !== undefined ? { database: args.database } : {}),
       }, { ifVersion: args.version?.trim() || undefined });
       if (isRejection(result)) return failRejection(result);
 
@@ -896,6 +935,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
         updated_at: new Date().toISOString(),
         expires_at: result.meta.expiresAt ?? undefined,
         password_protected: Boolean(result.meta.passwordHash),
+        database: Boolean(result.meta.database),
         version: result.pageVersion ?? '',
       };
       return ok(
@@ -1022,6 +1062,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           created_at: z.string().describe('When the folder was created, ISO 8601.'),
           expires_at: z.string().optional().describe('When the folder stops being served, if an expiry is set.'),
           password_protected: z.boolean().describe('Whether visitors need a password to open it.'),
+          database: z.boolean().optional().describe('For a page, whether it has a shared database (read it with read_page_data).'),
           url: z.string().describe('Public URL: the raw file, or the folder page.'),
           page_url: z.string().describe('Public URL of the folder page.'),
           file_count: z.number().int().describe('Number of files in the folder; always 0 for a page.'),
@@ -1083,6 +1124,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           created_at: meta.createdAt,
           expires_at: summary.expiresAt ?? undefined,
           password_protected: summary.isPasswordProtected,
+          database: summary.hasDatabase,
           url: shareUrl(prefix),
           page_url: shareUrl(prefix),
           file_count: 0,
@@ -1092,6 +1134,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           `Page "${prefix}": "${meta.title}", ${formatBytes(structured.size_bytes)} of HTML, published ${meta.createdAt}` +
             (structured.expires_at ? `, expires ${structured.expires_at}` : '') +
             (structured.password_protected ? ', password protected' : '') +
+            (structured.database ? ', with a database (read_page_data)' : '') +
             `\nPage URL: ${structured.url}` +
             '\nIt is a page, not a folder: it holds no files, and its content is replaced with update_page.',
           structured
@@ -1272,6 +1315,194 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
           : `Deleted ${prefix}/${filename}; ${remaining} file${remaining === 1 ? '' : 's'} remain in "${prefix}".`,
         { path: `${prefix}/${filename}`, deleted: true, folder_deleted: result.shareDeleted, remaining_files: remaining }
       );
+    }
+  );
+  /* ------------------------------------------------------------- page database --------- */
+  const documentSchema = z.object({
+    id: z.string().describe('The document id.'),
+    data: z.unknown().describe('The stored JSON value.'),
+    created_at: z.string().describe('When the document was first written, ISO 8601.'),
+    updated_at: z.string().describe('When the document was last written, ISO 8601.'),
+  });
+  const toDocumentItem = (d: DbDocument) => ({ id: d.id, data: d.data, created_at: d.createdAt, updated_at: d.updatedAt });
+
+  /** The page a database tool names, or the tool error explaining why it cannot be used. */
+  async function pageForDb(rawPrefix: string, mode: 'read' | 'write'): Promise<ShareMeta | CallToolResult> {
+    const prefix = rawPrefix.trim().replace(/^\/+|\/+$/g, '');
+    if (!isValidSlug(prefix)) return fail(`"${prefix}" is not a valid page name.`);
+    const meta = await storage.getMeta(prefix);
+    const denied = checkDbAccess(prefix, meta, mode, 'owner');
+    if (denied) return fail(denied.error);
+    return meta as ShareMeta;
+  }
+
+  server.registerTool(
+    'read_page_data',
+    {
+      title: 'Read page data',
+      description:
+        'Read the shared database of a published page (one published with "database": true): with only "prefix", ' +
+        'its collections and how many documents each holds; with "collection", every document in it, oldest first; ' +
+        'with "collection" and "id", one document. This is the data visitors wrote through window.shareDb. It reads ' +
+        'straight from storage, so it works on password-protected and expired pages, and on a page whose database ' +
+        'was turned off (the data is kept).',
+      inputSchema: lcd(
+        z.object({
+          prefix: z.string().min(1).max(80).describe('The page whose data to read, the name it is published under.'),
+          collection: z.string().max(64).optional().describe('A collection to list. Omit to list the collections.'),
+          id: z.string().max(128).optional().describe('One document to read from "collection". Omit to list the whole collection.'),
+        })
+      ),
+      outputSchema: lcd(
+        z.object({
+          prefix: z.string().describe('The page read.'),
+          database: z.boolean().describe('Whether the page currently has its database turned on.'),
+          collections: z
+            .array(z.object({ name: z.string().describe('Collection name.'), count: z.number().int().describe('Documents in it.') }))
+            .optional()
+            .describe('The collections, when no collection was given.'),
+          collection: z.string().optional().describe('The collection read, when one was given.'),
+          documents: z.array(documentSchema).optional().describe('The documents of the collection, when no id was given.'),
+          document: documentSchema.optional().describe('The document, when an id was given and it exists.'),
+          found: z.boolean().optional().describe('When an id was given, whether that document exists.'),
+        })
+      ),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args, ctx) => {
+      const denied = requireScope(ctx as ToolContext, SCOPE_READ);
+      if (denied) return denied;
+      const meta = await pageForDb(args.prefix, 'read');
+      if ('content' in meta) return meta;
+      const prefix = meta.slug;
+      const database = Boolean(meta.database);
+      const off = database ? '' : ' (its database is turned off; this is the data it kept)';
+      const collection = args.collection?.trim() || undefined;
+      const id = args.id?.trim() || undefined;
+
+      if (collection === undefined) {
+        if (id !== undefined) return fail('"id" needs a "collection" to look in.');
+        const collections = await listCollections(storage, prefix);
+        const text = collections.length
+          ? `Page "${prefix}" has ${collections.length} collection${collections.length === 1 ? '' : 's'}${off}:\n` +
+            collections.map((c) => `${c.name}: ${c.count} document${c.count === 1 ? '' : 's'}`).join('\n')
+          : `Page "${prefix}" has no data yet${off}.`;
+        return ok(text, { prefix, database, collections });
+      }
+
+      if (id === undefined) {
+        const docs = await listDocuments(storage, prefix, collection);
+        if (isDbRejection(docs)) return fail(docs.error);
+        const documents = docs.map(toDocumentItem);
+        const text = documents.length
+          ? `${documents.length} document${documents.length === 1 ? '' : 's'} in "${prefix}" / "${collection}"${off}:\n` +
+            JSON.stringify(documents, null, 2)
+          : `Collection "${collection}" of "${prefix}" is empty or does not exist${off}.`;
+        return ok(text, { prefix, database, collection, documents });
+      }
+
+      const doc = await getDocument(storage, prefix, collection, id);
+      if (isDbRejection(doc)) {
+        if (doc.missing) return ok(`No document "${id}" in "${prefix}" / "${collection}"${off}.`, { prefix, database, collection, found: false });
+        return fail(doc.error);
+      }
+      const document = toDocumentItem(doc);
+      return ok(`"${prefix}" / "${collection}" / "${id}"${off}:\n${JSON.stringify(document, null, 2)}`, {
+        prefix,
+        database,
+        collection,
+        document,
+        found: true,
+      });
+    }
+  );
+
+  server.registerTool(
+    'write_page_data',
+    {
+      title: 'Write page data',
+      description:
+        'Change one document in the shared database of a published page, the same data its visitors see through ' +
+        'window.shareDb. "add" stores data under a new random id; "set" creates or replaces the document "id"; ' +
+        '"update" shallow-merges a JSON object into the document "id", creating it when absent; "delete" removes the ' +
+        'document "id". The page must have its database turned on (update_page with "database": true). Changes are ' +
+        'immediate and visible to every visitor; there is no undo.',
+      inputSchema: lcd(
+        z.object({
+          prefix: z.string().min(1).max(80).describe('The page whose data to change, the name it is published under.'),
+          collection: z
+            .string()
+            .min(1)
+            .max(64)
+            .describe('Collection name: lowercase letters, digits, "_" and "-", starting with a letter or digit. Created on first write.'),
+          action: z.enum(['add', 'set', 'update', 'delete']).describe('What to do with the document.'),
+          id: z
+            .string()
+            .max(128)
+            .optional()
+            .describe('Document id (letters, digits, "_" and "-"). Required for set, update and delete; ignored for add.'),
+          data_json: z
+            .string()
+            .optional()
+            .describe(
+              'The value to store, as JSON text (e.g. "{\"choice\": \"b\"}"). Any JSON value for add and set; a JSON object ' +
+                `for update. Required except for delete. At most ${DB_LIMITS.documentBytes / 1024} KB.`
+            ),
+        })
+      ),
+      outputSchema: lcd(
+        z.object({
+          prefix: z.string().describe('The page changed.'),
+          collection: z.string().describe('The collection changed.'),
+          action: z.string().describe('The action performed.'),
+          id: z.string().describe('The document id; for add, the new id.'),
+          created: z.boolean().optional().describe('For add, set and update, whether the document is new.'),
+          deleted: z.boolean().optional().describe('For delete, whether the document existed.'),
+          document: documentSchema.optional().describe('The document as stored, for add, set and update.'),
+        })
+      ),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async (args, ctx) => {
+      const denied = requireScope(ctx as ToolContext, args.action === 'delete' ? SCOPE_DELETE : SCOPE_WRITE);
+      if (denied) return denied;
+      const meta = await pageForDb(args.prefix, 'write');
+      if ('content' in meta) return meta;
+      const prefix = meta.slug;
+      const collection = args.collection.trim();
+      const id = args.id?.trim() || undefined;
+      if (args.action !== 'add' && id === undefined) return fail(`"${args.action}" needs the "id" of the document.`);
+
+      if (args.action === 'delete') {
+        const result = await deleteDocument(storage, prefix, collection, id as string);
+        if (isDbRejection(result)) return fail(result.error);
+        return ok(
+          result.deleted
+            ? `Deleted "${prefix}" / "${collection}" / "${id}".`
+            : `"${prefix}" / "${collection}" has no document "${id}"; nothing to delete.`,
+          { prefix, collection, action: 'delete', id: id as string, deleted: result.deleted }
+        );
+      }
+
+      if (args.data_json === undefined) return fail(`"${args.action}" needs "data_json", the value to store as JSON text.`);
+      let data: unknown;
+      try {
+        data = JSON.parse(args.data_json);
+      } catch (err) {
+        return fail(`"data_json" is not valid JSON: ${(err as Error).message}. Send the value as JSON text, e.g. {"choice": "b"}.`);
+      }
+      const result = await writeDocument(storage, prefix, collection, args.action, id, data);
+      if (isDbRejection(result)) return fail(result.error);
+      const document = toDocumentItem(result.document);
+      const verb = args.action === 'add' ? 'Added' : args.action === 'set' ? (result.created ? 'Created' : 'Replaced') : result.created ? 'Created' : 'Updated';
+      return ok(`${verb} "${prefix}" / "${collection}" / "${document.id}":\n${JSON.stringify(document.data, null, 2)}`, {
+        prefix,
+        collection,
+        action: args.action,
+        id: document.id,
+        created: result.created,
+        document,
+      });
     }
   );
 }
