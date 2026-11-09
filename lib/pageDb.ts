@@ -19,7 +19,7 @@
  */
 
 import crypto from 'node:crypto';
-import { sameSignature, signWithCookieSecret } from './auth.ts';
+import { sameSignature, signWithCookieSecret, unlockBinding } from './auth.ts';
 import { AssetConflictError, type ShareMeta, type StorageProvider } from './storage.ts';
 import { hasExpired, isRejection, type ShareInputRejection } from './shareInput.ts';
 import { RateLimiter } from './mcp/ratelimit.ts';
@@ -90,17 +90,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export const PAGE_DB_TOKEN_DAYS = 8;
 const TOKEN_PREFIX = 'pagedb.';
 
-/** What a token is bound to besides the slug: changes when the password changes or the page is recreated. */
-function bindingOf(meta: ShareMeta): string {
-  return crypto
-    .createHash('sha256')
-    .update(`${meta.createdAt}\n${meta.passwordHash ?? ''}`)
-    .digest('hex')
-    .slice(0, 32);
-}
-
+/**
+ * Bound, like the unlock cookie, to `unlockBinding`: the token stops working when the password is
+ * set, changed or removed, or the page is deleted and published again.
+ */
 function signToken(meta: ShareMeta, day: number): string {
-  return signWithCookieSecret(`pagedb:${meta.slug}:${day}:${bindingOf(meta)}`);
+  return signWithCookieSecret(`pagedb:${meta.slug}:${day}:${unlockBinding(meta)}`);
 }
 
 /**
