@@ -38,7 +38,7 @@ A lightweight Next.js service on Vercel backed by Vercel Blob, serving standalon
   * Obscure URLs are **not** access control.
   * Password hashing uses `crypto.scrypt` tuned to ~100ms key derivation time to defeat brute-force guessing without needing serverless state.
   * Requests attempting to unlock non-existent or unprotected slugs run dummy scrypt derivations to guarantee constant execution time and prevent slug probing.
-  * Successful unlock sets an HTTP-only, `SameSite=Lax`, `Secure` cookie scoped to `Path=/[slug]` signed with `SHARE_COOKIE_SECRET` (never reusing `SHARE_API_TOKEN`).
+  * Successful unlock sets an HTTP-only, `SameSite=Lax`, `Secure` cookie scoped to `Path=/[slug]` signed with `SHARE_COOKIE_SECRET` (never reusing `SHARE_API_TOKEN`). The signature also covers the share's creation time and password hash, so setting, changing or removing the password, or deleting the share and publishing it again under the same slug, ends every earlier unlock.
 
 ---
 

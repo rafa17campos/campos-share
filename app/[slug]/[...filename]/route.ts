@@ -2,6 +2,7 @@ import { hasExpired } from '../../../lib/shareInput.ts';
 import { getStorage, isReservedAssetName } from '../../../lib/storage.ts';
 import {
   verifyUnlockCookieValue,
+  unlockBinding,
   getUnlockCookieFromRequest,
 } from '../../../lib/auth.ts';
 
@@ -49,7 +50,7 @@ export async function GET(
   const isProtected = Boolean(meta.passwordHash);
   if (isProtected) {
     const cookieValue = getUnlockCookieFromRequest(request, slug);
-    const isUnlocked = verifyUnlockCookieValue(cookieValue, slug);
+    const isUnlocked = verifyUnlockCookieValue(cookieValue, slug, unlockBinding(meta));
 
     if (!isUnlocked) {
       return new Response('Unauthorized', {

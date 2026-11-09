@@ -130,23 +130,44 @@ function getCookieSecret(): string {
 }
 
 /**
- * Generates an HMAC-signed session unlock token for a slug.
- * Signed strictly with SHARE_COOKIE_SECRET, never SHARE_API_TOKEN.
- * Throws immediately if SHARE_COOKIE_SECRET is missing.
+ * What an unlock is bound to besides the slug: the share's creation time and password hash. It
+ * changes when the password is set, changed or removed and when the share is deleted and created
+ * again, so an unlock granted before any of those no longer opens the share. It is not stored in
+ * the cookie; it is recomputed from the record on every check.
  */
-export function createUnlockCookieValue(slug: string): string {
-  const secret = getCookieSecret();
-  const timestamp = Date.now();
-  const payload = `${slug}:${timestamp}`;
-  const hmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
-  return `${payload}:${hmac}`;
+export function unlockBinding(share: { createdAt: string; passwordHash?: string | null }): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${share.createdAt}\n${share.passwordHash ?? ''}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
+function unlockSignature(secret: string, slug: string, timestamp: string, binding: string): string {
+  return crypto.createHmac('sha256', secret).update(`${slug}:${timestamp}:${binding}`).digest('hex');
 }
 
 /**
- * Verifies that the provided cookie value is valid, unexpired, and matches the slug.
+ * Generates an HMAC-signed session unlock token for a slug, bound to `binding` (`unlockBinding`).
+ * Signed strictly with SHARE_COOKIE_SECRET, never SHARE_API_TOKEN.
  * Throws immediately if SHARE_COOKIE_SECRET is missing.
  */
-export function verifyUnlockCookieValue(cookieValue: string | null | undefined, slug: string): boolean {
+export function createUnlockCookieValue(slug: string, binding: string): string {
+  const secret = getCookieSecret();
+  const timestamp = String(Date.now());
+  return `${slug}:${timestamp}:${unlockSignature(secret, slug, timestamp, binding)}`;
+}
+
+/**
+ * Verifies that the provided cookie value is valid, unexpired, matches the slug and was issued for
+ * the share as it is now (`binding`, from `unlockBinding`).
+ * Throws immediately if SHARE_COOKIE_SECRET is missing.
+ */
+export function verifyUnlockCookieValue(
+  cookieValue: string | null | undefined,
+  slug: string,
+  binding: string
+): boolean {
   if (!cookieValue) return false;
 
   const parts = cookieValue.split(':');
@@ -165,8 +186,7 @@ export function verifyUnlockCookieValue(cookieValue: string | null | undefined, 
   }
 
   const secret = getCookieSecret();
-  const payload = `${cookieSlug}:${timestampStr}`;
-  const expectedHmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+  const expectedHmac = unlockSignature(secret, cookieSlug, timestampStr, binding);
 
   const expectedBuffer = Buffer.from(expectedHmac, 'hex');
   const signatureBuffer = Buffer.from(signature, 'hex');

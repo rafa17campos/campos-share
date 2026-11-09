@@ -13,6 +13,7 @@ import {
 import { POST as handleSweepOrphans } from '../app/api/shares/orphans/route.ts';
 import { GET as handleViewShare } from '../app/[slug]/route.ts';
 import { POST as handleUnlockShare } from '../app/[slug]/unlock/route.ts';
+import { replaceShare } from '../lib/shares.ts';
 import { GET as handleStreamAsset } from '../app/[slug]/[...filename]/route.ts';
 
 const TEST_API_TOKEN = 'secret-test-token-xyz789';
@@ -979,4 +980,53 @@ test('Asset names with segments starting with __ are rejected across all endpoin
   assert.equal(createRes.status, 400);
   const createErr = await createRes.json();
   assert.ok(createErr.error.includes('reserved prefix ("__")'));
+});
+
+test('An unlock stops working once the password changes or the share is created again', async () => {
+  const storage = new MemoryStorage();
+  setStorageForTesting(storage);
+  const create = (password) =>
+    handleCreateShare(
+      createApiRequest('https://share.example.invalid/api/shares', 'POST', {
+        slug: 'secreto',
+        title: 'Secreto',
+        lang: 'es',
+        kind: 'uploaded',
+        html: '<p>Contenido secreto</p>',
+        password,
+      })
+    );
+  const unlock = async (password) => {
+    const res = await handleUnlockShare(
+      new Request('https://share.example.invalid/secreto/unlock', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ password }).toString(),
+      }),
+      { params: Promise.resolve({ slug: 'secreto' }) }
+    );
+    return res.headers.get('set-cookie').split(';')[0];
+  };
+  const view = async (cookie) => {
+    const res = await handleViewShare(new Request('https://share.example.invalid/secreto', { headers: { cookie } }), {
+      params: Promise.resolve({ slug: 'secreto' }),
+    });
+    return res.text();
+  };
+
+  assert.equal((await create('clave-uno-111')).status, 201);
+  const oldCookie = await unlock('clave-uno-111');
+  assert.match(await view(oldCookie), /Contenido secreto/);
+
+  // Password changed: the cookie granted under the old one no longer opens the page.
+  await replaceShare(storage, 'secreto', { title: 'Secreto', lang: 'es', kind: 'uploaded', html: '<p>Contenido secreto</p>', password: 'clave-dos-222' });
+  assert.doesNotMatch(await view(oldCookie), /Contenido secreto/);
+  const newCookie = await unlock('clave-dos-222');
+  assert.match(await view(newCookie), /Contenido secreto/);
+
+  // Deleted and published again under the same slug, same password: earlier unlocks do not carry over.
+  await storage.deleteShare('secreto');
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal((await create('clave-dos-222')).status, 201);
+  assert.doesNotMatch(await view(newCookie), /Contenido secreto/);
 });

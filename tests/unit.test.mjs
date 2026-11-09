@@ -13,6 +13,7 @@ import {
   runDummyPasswordCheck,
   createUnlockCookieValue,
   verifyUnlockCookieValue,
+  unlockBinding,
 } from '../lib/auth.ts';
 import { getBaseUrl } from '../lib/config.ts';
 import { hasExpired, validateShareInput } from '../lib/shareInput.ts';
@@ -175,24 +176,33 @@ test('runDummyPasswordCheck executes without error', async () => {
 test('Unlock cookie creation and verification', () => {
   process.env.SHARE_COOKIE_SECRET = 'test-secret-key-1234567890';
   const slug = 'viaje-oporto';
-  const cookie = createUnlockCookieValue(slug);
+  const share = { createdAt: '2026-11-01T10:00:00.000Z', passwordHash: 'scrypt$N=32768$r=8$p=1$aa$bb' };
+  const binding = unlockBinding(share);
+  const cookie = createUnlockCookieValue(slug, binding);
 
-  assert.ok(verifyUnlockCookieValue(cookie, slug));
+  assert.ok(verifyUnlockCookieValue(cookie, slug, binding));
   // Wrong slug fails
-  assert.equal(verifyUnlockCookieValue(cookie, 'otro-slug'), false);
+  assert.equal(verifyUnlockCookieValue(cookie, 'otro-slug', binding), false);
   // Tampered cookie fails
-  assert.equal(verifyUnlockCookieValue(cookie + 'x', slug), false);
+  assert.equal(verifyUnlockCookieValue(cookie + 'x', slug, binding), false);
+  // A password set, changed or removed since the unlock fails
+  assert.equal(verifyUnlockCookieValue(cookie, slug, unlockBinding({ ...share, passwordHash: 'scrypt$N=32768$r=8$p=1$cc$dd' })), false);
+  assert.equal(verifyUnlockCookieValue(cookie, slug, unlockBinding({ ...share, passwordHash: null })), false);
+  // The same slug deleted and created again fails
+  assert.equal(verifyUnlockCookieValue(cookie, slug, unlockBinding({ ...share, createdAt: '2026-11-02T10:00:00.000Z' })), false);
+  // A cookie in the format issued before the binding existed fails
+  assert.equal(verifyUnlockCookieValue(`${slug}:${Date.now()}:${'a'.repeat(64)}`, slug, binding), false);
 });
 
 test('Missing SHARE_COOKIE_SECRET throws immediately without fallback', () => {
   const originalSecret = process.env.SHARE_COOKIE_SECRET;
   delete process.env.SHARE_COOKIE_SECRET;
   try {
-    assert.throws(() => createUnlockCookieValue('test-slug'), {
+    assert.throws(() => createUnlockCookieValue('test-slug', 'b'), {
       message: /SHARE_COOKIE_SECRET environment variable is required/,
     });
     assert.throws(
-      () => verifyUnlockCookieValue(`test-slug:${Date.now()}:${'a'.repeat(64)}`, 'test-slug'),
+      () => verifyUnlockCookieValue(`test-slug:${Date.now()}:${'a'.repeat(64)}`, 'test-slug', 'b'),
       { message: /SHARE_COOKIE_SECRET environment variable is required/ }
     );
   } finally {

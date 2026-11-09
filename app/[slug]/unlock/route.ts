@@ -4,6 +4,7 @@ import {
   verifyPassword,
   runDummyPasswordCheck,
   createUnlockCookieValue,
+  unlockBinding,
 } from '../../../lib/auth.ts';
 
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -70,7 +71,7 @@ export async function POST(
   }
 
   // Password is correct; issue unlock cookie scoped to Path=/[slug]
-  const cookieValue = createUnlockCookieValue(slug);
+  const cookieValue = createUnlockCookieValue(slug, unlockBinding(meta));
   const cookieName = `share_unlock_${slug}`;
   const isProd = process.env.NODE_ENV === 'production';
   const secureFlag = isProd ? '; Secure' : '';
