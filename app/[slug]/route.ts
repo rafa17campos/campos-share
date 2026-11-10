@@ -5,6 +5,7 @@ import { isInlineText } from '../../lib/text.ts';
 import { getBaseUrl } from '../../lib/config.ts';
 import { PAGE_ASSET_NAME } from '../../lib/shares.ts';
 import { issuePageDbToken } from '../../lib/pageDb.ts';
+import { UNTRUSTED_CONTENT_POLICY } from '../../lib/sandbox.ts';
 import {
   renderSharePage,
   injectUploadedHtml,
@@ -18,7 +19,7 @@ import {
 
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
-const UPLOADED_PAGE_SANDBOX = 'sandbox allow-scripts';
+const UPLOADED_PAGE_SANDBOX = UNTRUSTED_CONTENT_POLICY;
 /**
  * The pages this service renders itself (a folder's page, the password prompt) run no script, so
  * none is allowed: a link or markup that slipped past the renderer still cannot run on this origin.

@@ -5,6 +5,7 @@ import {
   unlockBinding,
   getUnlockCookieFromRequest,
 } from '../../../lib/auth.ts';
+import { UNTRUSTED_CONTENT_POLICY } from '../../../lib/sandbox.ts';
 
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
@@ -111,7 +112,7 @@ export async function GET(
     ETag: asset.etag,
   };
   if (isScriptable(declared)) {
-    headers['Content-Security-Policy'] = 'sandbox allow-scripts';
+    headers['Content-Security-Policy'] = UNTRUSTED_CONTENT_POLICY;
   }
 
   if (asset.notModified || !asset.stream) {

@@ -704,7 +704,7 @@ test('a page published through the tools is live at its URL and stays there when
 
   const served = await handleViewShare(new Request('https://share.example.invalid/cenas'), { params: Promise.resolve({ slug: 'cenas' }) });
   assert.equal(served.status, 200);
-  assert.equal(served.headers.get('content-security-policy'), 'sandbox allow-scripts', 'a page stays in an opaque origin');
+  assert.equal(served.headers.get('content-security-policy'), 'sandbox allow-scripts allow-forms allow-modals', 'a page stays in an opaque origin');
   const firstEtag = served.headers.get('etag');
   const firstBody = await served.text();
   assert.match(firstBody, /<h1>Cenas<\/h1>/);

@@ -92,9 +92,9 @@ test('a folder page allows no script; script-capable files are sandboxed, others
     (await handleStreamAsset(new Request(`${BASE}/mixta/${name}`), { params: Promise.resolve({ slug: 'mixta', filename: [name] }) })).headers.get(
       'content-security-policy'
     );
-  assert.equal(await csp('pagina.html'), 'sandbox allow-scripts');
-  assert.equal(await csp('dibujo.svg'), 'sandbox allow-scripts');
-  assert.equal(await csp('datos.xml'), 'sandbox allow-scripts');
+  assert.equal(await csp('pagina.html'), 'sandbox allow-scripts allow-forms allow-modals');
+  assert.equal(await csp('dibujo.svg'), 'sandbox allow-scripts allow-forms allow-modals');
+  assert.equal(await csp('datos.xml'), 'sandbox allow-scripts allow-forms allow-modals');
   assert.equal(await csp('foto.png'), null);
   assert.equal(await csp('doc.pdf'), null, 'a sandbox would stop the browser PDF viewer');
 });
@@ -199,4 +199,14 @@ test('listing by prefix reads only the records under it', async () => {
   }
   assert.deepEqual((await listShares(storage, 'viaje')).map((m) => m.slug).sort(), ['viaje-a', 'viaje-b']);
   assert.equal((await listShares(storage)).length, 3);
+});
+
+test('the sandbox for untrusted content allows forms and modals, never its own origin back', async () => {
+  const { UNTRUSTED_CONTENT_POLICY } = await import('../lib/sandbox.ts');
+  const flags = UNTRUSTED_CONTENT_POLICY.split(/\s+/);
+  assert.equal(flags[0], 'sandbox');
+  assert.deepEqual(flags.slice(1).sort(), ['allow-forms', 'allow-modals', 'allow-scripts']);
+  for (const never of ['allow-same-origin', 'allow-top-navigation', 'allow-popups-to-escape-sandbox']) {
+    assert.ok(!flags.includes(never), never);
+  }
 });
