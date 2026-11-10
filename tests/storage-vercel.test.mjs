@@ -88,8 +88,10 @@ async function fakeBlob() {
       res.writeHead(200, headers);
       return res.end(blob.data);
     }
-    res.writeHead(500);
-    res.end(`unexpected ${req.method} ${host}${req.url}`);
+    // Fail the test loudly without echoing the request back.
+    console.error('fake Blob got an unexpected request', req.method, host, url.pathname);
+    res.writeHead(500, { 'content-type': 'text/plain' });
+    res.end('unexpected request');
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const local = `http://127.0.0.1:${server.address().port}`;
