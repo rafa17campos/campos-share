@@ -260,7 +260,7 @@ test('the page carries window.shareDb only when it has a database', async () => 
 
   const withDb = await viewPage('con');
   assert.equal(withDb.res.status, 200);
-  assert.equal(withDb.res.headers.get('content-security-policy'), 'sandbox allow-scripts');
+  assert.equal(withDb.res.headers.get('content-security-policy'), 'sandbox allow-scripts allow-forms allow-modals');
   assert.ok(injectedToken(withDb.html), 'token injected');
   assert.match(withDb.html, /var E = "https:\/\/share\.example\.invalid\/api\/db\/con"/);
   assert.ok(withDb.html.indexOf('shareDb') < withDb.html.indexOf('<title>'), 'client comes first in <head>');
