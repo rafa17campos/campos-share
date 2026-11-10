@@ -183,14 +183,30 @@ function emptyDb(): PageDb {
   return { v: 1, collections: {} };
 }
 
-async function readDb(storage: StorageProvider, slug: string): Promise<{ db: PageDb; etag: string | null }> {
-  const read = await storage.getAsset(slug, PAGE_DB_ASSET_NAME);
-  if (!read || !read.stream) return { db: emptyDb(), etag: null };
-  const parsed = JSON.parse(await new Response(read.stream).text()) as PageDb;
+function parseDb(slug: string, text: string): PageDb {
+  const parsed = JSON.parse(text) as PageDb;
   if (parsed?.v !== 1 || !isPlainObject(parsed.collections)) {
     throw new Error(`The database of "${slug}" is not in a format this version reads`);
   }
-  return { db: parsed, etag: read.etag };
+  return parsed;
+}
+
+/** The store, for reading only. */
+async function readDb(storage: StorageProvider, slug: string): Promise<{ db: PageDb }> {
+  const read = await storage.getAsset(slug, PAGE_DB_ASSET_NAME);
+  if (!read || !read.stream) return { db: emptyDb() };
+  return { db: parseDb(slug, await new Response(read.stream).text()) };
+}
+
+/**
+ * The store with the ETag a conditional write compares against, for changing it. Not `getAsset`:
+ * its ETag stops matching once the blob is big enough to be served compressed (see
+ * `readAssetForUpdate` in storage.ts), and then every write would fail as "busy".
+ */
+async function readDbForUpdate(storage: StorageProvider, slug: string): Promise<{ db: PageDb; etag: string | null }> {
+  const read = await storage.readAssetForUpdate(slug, PAGE_DB_ASSET_NAME);
+  if (!read) return { db: emptyDb(), etag: null };
+  return { db: parseDb(slug, read.text), etag: read.etag };
 }
 
 function own<T>(record: Record<string, T>, key: string): T | undefined {
@@ -216,7 +232,7 @@ async function mutateDb<T>(
   change: (db: PageDb) => Change<T> | DbRejection
 ): Promise<T | DbRejection> {
   for (let attempt = 1; ; attempt++) {
-    const { db, etag } = await readDb(storage, slug);
+    const { db, etag } = await readDbForUpdate(storage, slug);
     const result = change(db);
     if (isRejection(result)) return result;
     if (!result.write) return result.value;
@@ -242,6 +258,9 @@ async function mutateDb<T>(
       if (attempt >= MUTATION_ATTEMPTS) {
         return { error: `The database of "${slug}" is busy with other writes; try again`, status: 409 };
       }
+      // Writers that collided would otherwise retry in lockstep and collide again: wait a random,
+      // growing moment so they fall into line (a page removing ten items at once is ten writers).
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 25 * attempt));
     }
   }
 }

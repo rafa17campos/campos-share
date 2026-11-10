@@ -1239,7 +1239,9 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       }
       const encoding = content === null ? 'base64' : 'text';
       const path = filename === null ? prefix : `${prefix}/${filename}`;
-      const version = contentVersion(read.etag);
+      // The version is the ETag the conditional write compares against (head), not the download's:
+      // a compressed download carries a different one, and update_page/update_file would refuse it.
+      const version = contentVersion(head.etag);
       const next = filename === null ? 'update_page' : 'update_file';
       return {
         content: [

@@ -149,6 +149,14 @@ export interface MetaRead {
   etag: string;
 }
 
+function isNotFound(err: unknown): boolean {
+  return (
+    err instanceof BlobNotFoundError ||
+    (err as { name?: string })?.name === 'BlobNotFoundError' ||
+    Boolean((err as Error)?.message?.toLowerCase().includes('not found'))
+  );
+}
+
 export interface SaveMetaOptions {
   /** Write only if the record still carries this ETag; otherwise throw `MetaConflictError`. */
   ifMatch?: string;
@@ -166,6 +174,11 @@ export interface StorageProvider {
     options?: PutAssetOptions
   ): Promise<{ url: string; size: number; etag: string }>;
   getAsset(slug: string, filename: string, options?: { ifNoneMatch?: string }): Promise<AssetRead | null>;
+  /**
+   * A file's text with the ETag a conditional write (`ifMatch`) compares against. Use this, never
+   * `getAsset`, to read something you are about to rewrite: see `VercelBlobStorage.readForUpdate`.
+   */
+  readAssetForUpdate(slug: string, filename: string): Promise<{ text: string; etag: string } | null>;
   headAsset(slug: string, filename: string): Promise<AssetHead | null>;
   createUploadTokens(slug: string, files: UploadRequestFile[]): Promise<UploadTokensResult>;
   deleteShare(slug: string): Promise<void>;
@@ -185,31 +198,58 @@ export class VercelBlobStorage implements StorageProvider {
     this.token = token || process.env.BLOB_READ_WRITE_TOKEN;
   }
 
+  /** A blob's text, read past the CDN cache; null when it does not exist. */
+  private async fetchText(pathname: string): Promise<string | null> {
+    try {
+      const result = await get(pathname, { access: BLOB_ACCESS, token: this.token, useCache: false });
+      if (!result || result.statusCode !== 200 || !result.stream) return null;
+      return await new Response(result.stream).text();
+    } catch (err: unknown) {
+      if (isNotFound(err)) return null;
+      throw err;
+    }
+  }
+
+  /**
+   * A blob's text together with the ETag that `put({ ifMatch })` compares against.
+   *
+   * That ETag is the one the API reports (`head`), not the one on a download: once a blob is large
+   * enough for the CDN to compress (about 1 KB), `get` answers with a different, weak validator, and
+   * a conditional write sent with it fails every time — every retry reads the same mismatched value.
+   * So the ETag is taken with `head` *before* the content is read. If a write lands in between, the
+   * content may be newer than that ETag, but then the store no longer carries it either, the
+   * conditional write fails and the caller reads again: a mismatch can only cost a retry, never an
+   * update.
+   */
+  private async readForUpdate(pathname: string): Promise<{ text: string; etag: string } | null> {
+    const before = await this.headPath(pathname);
+    if (!before) return null;
+    const text = await this.fetchText(pathname);
+    return text === null ? null : { text, etag: before.etag };
+  }
+
+  private async headPath(pathname: string): Promise<{ size: number; contentType: string; etag: string } | null> {
+    try {
+      const result = await head(pathname, { token: this.token });
+      return { size: result.size, contentType: result.contentType, etag: result.etag };
+    } catch (err: unknown) {
+      if (isNotFound(err)) return null;
+      throw err;
+    }
+  }
+
   async getMeta(slug: string): Promise<ShareMeta | null> {
-    const read = await this.readMeta(slug);
-    return read ? read.meta : null;
+    const text = await this.fetchText(`${slug}/__meta.json`);
+    return text === null ? null : (JSON.parse(text) as ShareMeta);
   }
 
   async readMeta(slug: string): Promise<MetaRead | null> {
-    const metaPath = `${slug}/__meta.json`;
-    try {
-      const result = await get(metaPath, { access: BLOB_ACCESS, token: this.token, useCache: false });
-      if (!result || result.statusCode !== 200 || !result.stream) {
-        return null;
-      }
-      const response = new Response(result.stream);
-      const text = await response.text();
-      return { meta: JSON.parse(text) as ShareMeta, etag: result.blob.etag };
-    } catch (err: unknown) {
-      if (err instanceof BlobNotFoundError || (err as { name?: string })?.name === 'BlobNotFoundError') {
-        return null;
-      }
-      // If error message contains 404 or not found
-      if ((err as Error)?.message?.toLowerCase().includes('not found')) {
-        return null;
-      }
-      throw err;
-    }
+    const read = await this.readForUpdate(`${slug}/__meta.json`);
+    return read ? { meta: JSON.parse(read.text) as ShareMeta, etag: read.etag } : null;
+  }
+
+  async readAssetForUpdate(slug: string, filename: string): Promise<{ text: string; etag: string } | null> {
+    return this.readForUpdate(`${slug}/${filename}`);
   }
 
   async saveMeta(slug: string, meta: ShareMeta, options: SaveMetaOptions = {}): Promise<void> {
@@ -307,24 +347,8 @@ export class VercelBlobStorage implements StorageProvider {
   }
 
   async headAsset(slug: string, filename: string): Promise<AssetHead | null> {
-    const assetPath = `${slug}/${filename}`;
-    try {
-      const result = await head(assetPath, { token: this.token });
-      return {
-        exists: true,
-        size: result.size,
-        contentType: result.contentType,
-        etag: result.etag,
-      };
-    } catch (err: unknown) {
-      if (err instanceof BlobNotFoundError || (err as { name?: string })?.name === 'BlobNotFoundError') {
-        return null;
-      }
-      if ((err as Error)?.message?.toLowerCase().includes('not found')) {
-        return null;
-      }
-      throw err;
-    }
+    const result = await this.headPath(`${slug}/${filename}`);
+    return result ? { exists: true, ...result } : null;
   }
 
   async createUploadTokens(
@@ -579,6 +603,12 @@ export class MemoryStorage implements StorageProvider {
       etag,
       notModified: false,
     };
+  }
+
+  async readAssetForUpdate(slug: string, filename: string): Promise<{ text: string; etag: string } | null> {
+    const entry = this.blobs.get(`${slug}/${filename}`);
+    if (!entry) return null;
+    return { text: new TextDecoder().decode(entry.data), etag: memoryEtag(entry.data) };
   }
 
   async headAsset(slug: string, filename: string): Promise<AssetHead | null> {
