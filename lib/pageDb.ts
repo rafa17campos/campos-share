@@ -23,6 +23,7 @@ import { sameSignature, signWithCookieSecret, unlockBinding } from './auth.ts';
 import { AssetConflictError, type ShareMeta, type StorageProvider } from './storage.ts';
 import { hasExpired, isRejection, type ShareInputRejection } from './shareInput.ts';
 import { RateLimiter } from './mcp/ratelimit.ts';
+import { backoffBeforeRetry } from './conflictRetry.ts';
 
 export const PAGE_DB_ASSET_NAME = '__db.json';
 
@@ -40,7 +41,8 @@ export const COLLECTION_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 export const DOCUMENT_ID_REGEX = /^(?!__)[A-Za-z0-9_-]{1,128}$/;
 
 type StoredDocument = { data: unknown; createdAt: string; updatedAt: string };
-type PageDb = { v: 1; collections: Record<string, Record<string, StoredDocument>> };
+/** `rev` changes on every write, so the store never repeats its bytes, nor with them its ETag. */
+type PageDb = { v: 1; rev?: string; collections: Record<string, Record<string, StoredDocument>> };
 
 export type DbDocument = { id: string; data: unknown; createdAt: string; updatedAt: string };
 export type DbCollection = { name: string; count: number };
@@ -206,7 +208,7 @@ async function readDb(storage: StorageProvider, slug: string): Promise<{ db: Pag
 async function readDbForUpdate(storage: StorageProvider, slug: string): Promise<{ db: PageDb; etag: string | null }> {
   const read = await storage.readAssetForUpdate(slug, PAGE_DB_ASSET_NAME);
   if (!read) return { db: emptyDb(), etag: null };
-  return { db: parseDb(slug, read.text), etag: read.etag };
+  return { db: parseDb(slug, new TextDecoder().decode(read.data)), etag: read.etag };
 }
 
 function own<T>(record: Record<string, T>, key: string): T | undefined {
@@ -217,7 +219,7 @@ function toDocument(id: string, doc: StoredDocument): DbDocument {
   return { id, data: doc.data, createdAt: doc.createdAt, updatedAt: doc.updatedAt };
 }
 
-const MUTATION_ATTEMPTS = 8;
+const MUTATION_ATTEMPTS = 10;
 
 type Change<T> = { value: T; write: boolean };
 
@@ -236,6 +238,7 @@ async function mutateDb<T>(
     const result = change(db);
     if (isRejection(result)) return result;
     if (!result.write) return result.value;
+    db.rev = crypto.randomUUID();
     const text = JSON.stringify(db);
     const size = Buffer.byteLength(text, 'utf8');
     if (size > DB_LIMITS.storeBytes) {
@@ -258,9 +261,8 @@ async function mutateDb<T>(
       if (attempt >= MUTATION_ATTEMPTS) {
         return { error: `The database of "${slug}" is busy with other writes; try again`, status: 409 };
       }
-      // Writers that collided would otherwise retry in lockstep and collide again: wait a random,
-      // growing moment so they fall into line (a page removing ten items at once is ten writers).
-      await new Promise((resolve) => setTimeout(resolve, Math.random() * 25 * attempt));
+      // A page removing ten items at once is ten writers on one blob.
+      await backoffBeforeRetry(attempt);
     }
   }
 }

@@ -1224,11 +1224,13 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
             `tool result. Download it from ${url} instead.`
         );
       }
-      const read = await storage.getAsset(prefix, blobName);
-      if (!read || !read.stream) return fail(`The content of "${args.path.trim()}" is missing from storage.`);
-      const bytes = Buffer.from(await new Response(read.stream).arrayBuffer());
+      // Content and version from one consistent read: the version is the ETag a conditional write
+      // compares against, and it describes exactly these bytes (see readAssetForUpdate).
+      const read = await storage.readAssetForUpdate(prefix, blobName);
+      if (!read) return fail(`The content of "${args.path.trim()}" is missing from storage.`);
+      const bytes = Buffer.from(read.data);
 
-      const contentType = filename === null ? 'text/html; charset=utf-8' : read.contentType;
+      const contentType = filename === null ? 'text/html; charset=utf-8' : head.contentType;
       let content: string | null = null;
       if (isTextType(contentType)) {
         try {
@@ -1239,9 +1241,7 @@ export function registerShareTools(server: McpServer, deps: ToolDeps): void {
       }
       const encoding = content === null ? 'base64' : 'text';
       const path = filename === null ? prefix : `${prefix}/${filename}`;
-      // The version is the ETag the conditional write compares against (head), not the download's:
-      // a compressed download carries a different one, and update_page/update_file would refuse it.
-      const version = contentVersion(head.etag);
+      const version = contentVersion(read.etag);
       const next = filename === null ? 'update_page' : 'update_file';
       return {
         content: [

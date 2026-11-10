@@ -6,7 +6,7 @@
  * switching to S3, MinIO, or local disk requires modifying only this file.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   put,
   del,
@@ -55,6 +55,12 @@ export interface ShareMeta {
   passwordHash?: string | null;
   /** An uploaded page that keeps a shared data store at `<slug>/__db.json` (see lib/pageDb.ts). */
   database?: boolean;
+  /**
+   * Set afresh on every save, so no two saves write the same bytes. A blob's ETag can follow its
+   * content, and a record that returned to earlier bytes would bring back an earlier ETag: a write
+   * conditional on that ETag would then succeed on top of a change it never saw.
+   */
+  rev?: string;
 }
 
 export interface UploadRequestFile {
@@ -143,6 +149,24 @@ export interface PutAssetOptions {
   ifAbsent?: boolean;
 }
 
+/** A file's bytes and the ETag of exactly those bytes, as a conditional write compares it. */
+export interface ContentForUpdate {
+  data: Uint8Array;
+  etag: string;
+}
+
+/** Saves of a record carry a fresh `rev`, so its bytes, and with them its ETag, never repeat. */
+function serializeMeta(meta: ShareMeta): string {
+  return JSON.stringify({ ...meta, rev: randomUUID() }, null, 2);
+}
+
+/**
+ * Downloads are asked for uncompressed. Blob's CDN compresses anything above about 1 KB otherwise,
+ * and a compressed download carries a weak ETag that is not the blob's and a Content-Length that is
+ * not its size.
+ */
+const IDENTITY = { 'accept-encoding': 'identity' };
+
 export interface MetaRead {
   meta: ShareMeta;
   /** The store's ETag of the record as read; hand it back to `saveMeta` as `ifMatch`. */
@@ -178,7 +202,7 @@ export interface StorageProvider {
    * A file's text with the ETag a conditional write (`ifMatch`) compares against. Use this, never
    * `getAsset`, to read something you are about to rewrite: see `VercelBlobStorage.readForUpdate`.
    */
-  readAssetForUpdate(slug: string, filename: string): Promise<{ text: string; etag: string } | null>;
+  readAssetForUpdate(slug: string, filename: string): Promise<ContentForUpdate | null>;
   headAsset(slug: string, filename: string): Promise<AssetHead | null>;
   createUploadTokens(slug: string, files: UploadRequestFile[]): Promise<UploadTokensResult>;
   deleteShare(slug: string): Promise<void>;
@@ -198,12 +222,12 @@ export class VercelBlobStorage implements StorageProvider {
     this.token = token || process.env.BLOB_READ_WRITE_TOKEN;
   }
 
-  /** A blob's text, read past the CDN cache; null when it does not exist. */
-  private async fetchText(pathname: string): Promise<string | null> {
+  /** A blob's bytes, read past the CDN cache; null when it does not exist. */
+  private async fetchBytes(pathname: string): Promise<Uint8Array | null> {
     try {
-      const result = await get(pathname, { access: BLOB_ACCESS, token: this.token, useCache: false });
+      const result = await get(pathname, { access: BLOB_ACCESS, token: this.token, useCache: false, headers: IDENTITY });
       if (!result || result.statusCode !== 200 || !result.stream) return null;
-      return await new Response(result.stream).text();
+      return new Uint8Array(await new Response(result.stream).arrayBuffer());
     } catch (err: unknown) {
       if (isNotFound(err)) return null;
       throw err;
@@ -211,21 +235,30 @@ export class VercelBlobStorage implements StorageProvider {
   }
 
   /**
-   * A blob's text together with the ETag that `put({ ifMatch })` compares against.
+   * A blob's bytes together with the ETag that `put({ ifMatch })` compares against: the one the API
+   * reports (`head`), never the one on a download, which is not the same once the CDN compresses.
    *
-   * That ETag is the one the API reports (`head`), not the one on a download: once a blob is large
-   * enough for the CDN to compress (about 1 KB), `get` answers with a different, weak validator, and
-   * a conditional write sent with it fails every time — every retry reads the same mismatched value.
-   * So the ETag is taken with `head` *before* the content is read. If a write lands in between, the
-   * content may be newer than that ETag, but then the store no longer carries it either, the
-   * conditional write fails and the caller reads again: a mismatch can only cost a retry, never an
-   * update.
+   * Content and ETag come from separate requests, so the ETag is read on both sides of the content
+   * and only kept when it did not move: then nothing was written in between, and since every save
+   * writes bytes no earlier save wrote (`rev`), an unchanged ETag means unchanged content. If writes
+   * keep landing in between, the first ETag is returned: the content may then be newer than it, but
+   * the store no longer carries that ETag either, so the conditional write fails and the caller
+   * reads again. A mismatch can cost a retry, never an update.
    */
-  private async readForUpdate(pathname: string): Promise<{ text: string; etag: string } | null> {
-    const before = await this.headPath(pathname);
-    if (!before) return null;
-    const text = await this.fetchText(pathname);
-    return text === null ? null : { text, etag: before.etag };
+  private async readForUpdate(pathname: string): Promise<ContentForUpdate | null> {
+    let first: string | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await this.headPath(pathname);
+      if (!before) return null;
+      first ??= before.etag;
+      const data = await this.fetchBytes(pathname);
+      if (!data) return null;
+      const after = await this.headPath(pathname);
+      if (!after) return null;
+      if (after.etag === before.etag) return { data, etag: before.etag };
+    }
+    const data = await this.fetchBytes(pathname);
+    return data ? { data, etag: first as string } : null;
   }
 
   private async headPath(pathname: string): Promise<{ size: number; contentType: string; etag: string } | null> {
@@ -239,23 +272,23 @@ export class VercelBlobStorage implements StorageProvider {
   }
 
   async getMeta(slug: string): Promise<ShareMeta | null> {
-    const text = await this.fetchText(`${slug}/__meta.json`);
-    return text === null ? null : (JSON.parse(text) as ShareMeta);
+    const data = await this.fetchBytes(`${slug}/__meta.json`);
+    return data === null ? null : (JSON.parse(new TextDecoder().decode(data)) as ShareMeta);
   }
 
   async readMeta(slug: string): Promise<MetaRead | null> {
     const read = await this.readForUpdate(`${slug}/__meta.json`);
-    return read ? { meta: JSON.parse(read.text) as ShareMeta, etag: read.etag } : null;
+    return read ? { meta: JSON.parse(new TextDecoder().decode(read.data)) as ShareMeta, etag: read.etag } : null;
   }
 
-  async readAssetForUpdate(slug: string, filename: string): Promise<{ text: string; etag: string } | null> {
+  async readAssetForUpdate(slug: string, filename: string): Promise<ContentForUpdate | null> {
     return this.readForUpdate(`${slug}/${filename}`);
   }
 
   async saveMeta(slug: string, meta: ShareMeta, options: SaveMetaOptions = {}): Promise<void> {
     const metaPath = `${slug}/__meta.json`;
     try {
-      await put(metaPath, JSON.stringify(meta, null, 2), {
+      await put(metaPath, serializeMeta(meta), {
         access: BLOB_ACCESS,
         contentType: 'application/json; charset=utf-8',
         addRandomSuffix: false,
@@ -320,6 +353,7 @@ export class VercelBlobStorage implements StorageProvider {
         token: this.token,
         useCache: false,
         ifNoneMatch: options.ifNoneMatch,
+        headers: IDENTITY,
       });
       if (!result) return null;
       if (result.statusCode === 304) {
@@ -336,12 +370,7 @@ export class VercelBlobStorage implements StorageProvider {
         notModified: false,
       };
     } catch (err: unknown) {
-      if (err instanceof BlobNotFoundError || (err as { name?: string })?.name === 'BlobNotFoundError') {
-        return null;
-      }
-      if ((err as Error)?.message?.toLowerCase().includes('not found')) {
-        return null;
-      }
+      if (isNotFound(err)) return null;
       throw err;
     }
   }
@@ -538,8 +567,7 @@ export class MemoryStorage implements StorageProvider {
       const current = this.blobs.get(`${slug}/__meta.json`);
       if (!current || memoryEtag(current.data) !== options.ifMatch) throw new MetaConflictError(slug);
     }
-    const text = JSON.stringify(meta, null, 2);
-    const data = new TextEncoder().encode(text);
+    const data = new TextEncoder().encode(serializeMeta(meta));
     this.blobs.set(`${slug}/__meta.json`, {
       data,
       contentType: 'application/json; charset=utf-8',
@@ -605,10 +633,15 @@ export class MemoryStorage implements StorageProvider {
     };
   }
 
-  async readAssetForUpdate(slug: string, filename: string): Promise<{ text: string; etag: string } | null> {
-    const entry = this.blobs.get(`${slug}/${filename}`);
-    if (!entry) return null;
-    return { text: new TextDecoder().decode(entry.data), etag: memoryEtag(entry.data) };
+  /**
+   * Built from headAsset and getAsset the way the Blob implementation is, so a subclass that changes
+   * what a download reports (tests/pagedb.test.mjs models the CDN) is seen through the same path.
+   */
+  async readAssetForUpdate(slug: string, filename: string): Promise<ContentForUpdate | null> {
+    const before = await this.headAsset(slug, filename);
+    const read = before ? await this.getAsset(slug, filename) : null;
+    if (!before || !read?.stream) return null;
+    return { data: new Uint8Array(await new Response(read.stream).arrayBuffer()), etag: before.etag };
   }
 
   async headAsset(slug: string, filename: string): Promise<AssetHead | null> {

@@ -21,6 +21,7 @@ import {
 import crypto from 'node:crypto';
 import { hashPassword } from './auth.ts';
 import { PAGE_DB_ASSET_NAME, ensurePageDb } from './pageDb.ts';
+import { backoffBeforeRetry } from './conflictRetry.ts';
 import { getBaseUrl } from './config.ts';
 import {
   SLUG_REGEX,
@@ -251,7 +252,7 @@ async function currentEtagAt(
 /** Only write if the content is still at this version, from `contentVersion`; omit to overwrite unconditionally. */
 export type ContentWriteOptions = { ifVersion?: string };
 
-const MUTATION_ATTEMPTS = 5;
+const MUTATION_ATTEMPTS = 8;
 
 /**
  * Read the record, change it, write it back only if nobody else wrote it in between, and start
@@ -275,6 +276,7 @@ async function mutateShare(
       return { meta: next, created: false };
     } catch (err) {
       if (!(err instanceof MetaConflictError) || attempt >= MUTATION_ATTEMPTS) throw err;
+      await backoffBeforeRetry(attempt);
     }
   }
 }
