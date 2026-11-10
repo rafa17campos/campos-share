@@ -23,6 +23,7 @@ import { sameSignature, signWithCookieSecret, unlockBinding } from './auth.ts';
 import { AssetConflictError, type ShareMeta, type StorageProvider } from './storage.ts';
 import { hasExpired, isRejection, type ShareInputRejection } from './shareInput.ts';
 import { RateLimiter } from './mcp/ratelimit.ts';
+import { backoffBeforeRetry } from './conflictRetry.ts';
 
 export const PAGE_DB_ASSET_NAME = '__db.json';
 
@@ -40,7 +41,8 @@ export const COLLECTION_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 export const DOCUMENT_ID_REGEX = /^(?!__)[A-Za-z0-9_-]{1,128}$/;
 
 type StoredDocument = { data: unknown; createdAt: string; updatedAt: string };
-type PageDb = { v: 1; collections: Record<string, Record<string, StoredDocument>> };
+/** `rev` changes on every write, so the store never repeats its bytes, nor with them its ETag. */
+type PageDb = { v: 1; rev?: string; collections: Record<string, Record<string, StoredDocument>> };
 
 export type DbDocument = { id: string; data: unknown; createdAt: string; updatedAt: string };
 export type DbCollection = { name: string; count: number };
@@ -183,14 +185,30 @@ function emptyDb(): PageDb {
   return { v: 1, collections: {} };
 }
 
-async function readDb(storage: StorageProvider, slug: string): Promise<{ db: PageDb; etag: string | null }> {
-  const read = await storage.getAsset(slug, PAGE_DB_ASSET_NAME);
-  if (!read || !read.stream) return { db: emptyDb(), etag: null };
-  const parsed = JSON.parse(await new Response(read.stream).text()) as PageDb;
+function parseDb(slug: string, text: string): PageDb {
+  const parsed = JSON.parse(text) as PageDb;
   if (parsed?.v !== 1 || !isPlainObject(parsed.collections)) {
     throw new Error(`The database of "${slug}" is not in a format this version reads`);
   }
-  return { db: parsed, etag: read.etag };
+  return parsed;
+}
+
+/** The store, for reading only. */
+async function readDb(storage: StorageProvider, slug: string): Promise<{ db: PageDb }> {
+  const read = await storage.getAsset(slug, PAGE_DB_ASSET_NAME);
+  if (!read || !read.stream) return { db: emptyDb() };
+  return { db: parseDb(slug, await new Response(read.stream).text()) };
+}
+
+/**
+ * The store with the ETag a conditional write compares against, for changing it. Not `getAsset`:
+ * its ETag stops matching once the blob is big enough to be served compressed (see
+ * `readAssetForUpdate` in storage.ts), and then every write would fail as "busy".
+ */
+async function readDbForUpdate(storage: StorageProvider, slug: string): Promise<{ db: PageDb; etag: string | null }> {
+  const read = await storage.readAssetForUpdate(slug, PAGE_DB_ASSET_NAME);
+  if (!read) return { db: emptyDb(), etag: null };
+  return { db: parseDb(slug, new TextDecoder().decode(read.data)), etag: read.etag };
 }
 
 function own<T>(record: Record<string, T>, key: string): T | undefined {
@@ -201,7 +219,7 @@ function toDocument(id: string, doc: StoredDocument): DbDocument {
   return { id, data: doc.data, createdAt: doc.createdAt, updatedAt: doc.updatedAt };
 }
 
-const MUTATION_ATTEMPTS = 8;
+const MUTATION_ATTEMPTS = 10;
 
 type Change<T> = { value: T; write: boolean };
 
@@ -216,10 +234,11 @@ async function mutateDb<T>(
   change: (db: PageDb) => Change<T> | DbRejection
 ): Promise<T | DbRejection> {
   for (let attempt = 1; ; attempt++) {
-    const { db, etag } = await readDb(storage, slug);
+    const { db, etag } = await readDbForUpdate(storage, slug);
     const result = change(db);
     if (isRejection(result)) return result;
     if (!result.write) return result.value;
+    db.rev = crypto.randomUUID();
     const text = JSON.stringify(db);
     const size = Buffer.byteLength(text, 'utf8');
     if (size > DB_LIMITS.storeBytes) {
@@ -242,6 +261,8 @@ async function mutateDb<T>(
       if (attempt >= MUTATION_ATTEMPTS) {
         return { error: `The database of "${slug}" is busy with other writes; try again`, status: 409 };
       }
+      // A page removing ten items at once is ten writers on one blob.
+      await backoffBeforeRetry(attempt);
     }
   }
 }

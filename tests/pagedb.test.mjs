@@ -779,3 +779,57 @@ test('MCP: read_page_data cursor survives deletions between pages, and ids sort 
   assert.ok(Buffer.byteLength(read.content[0].text) < 40 * 1024);
   await client.close();
 });
+
+/**
+ * Behaves like Vercel Blob behind its CDN: a download of a blob larger than about 1 KB comes back
+ * compressed, with a weak validator that is not the ETag a conditional write compares against.
+ */
+class CompressingCdnStorage extends MemoryStorage {
+  async getAsset(slug, filename, options = {}) {
+    const read = await super.getAsset(slug, filename, options);
+    if (!read || read.size <= 1000) return read;
+    return { ...read, etag: `W/"cdn-${read.etag.replace(/"/g, '').slice(0, 12)}"` };
+  }
+}
+
+test('writes keep working once the store is big enough to be served compressed', async () => {
+  const storage = new CompressingCdnStorage();
+  setStorageForTesting(storage);
+  pageDbWriteLimiter.reset();
+  await publishPage(storage, 'grande-cdn');
+  // Well past 1 KB, the size at which every write started failing as "busy" in production.
+  for (let i = 0; i < 12; i++) {
+    const r = await writeDocument(storage, 'grande-cdn', 'items', 'add', undefined, { name: `cosa ${i}`, nota: 'x'.repeat(60) });
+    assert.equal(r.created, true, `write ${i}: ${JSON.stringify(r)}`);
+  }
+  assert.ok(storage.blobs.get(`grande-cdn/${PAGE_DB_ASSET_NAME}`).data.length > 1000);
+  const patched = await writeDocument(storage, 'grande-cdn', 'items', 'set', 'fijo', { ok: true });
+  assert.equal(patched.created, true);
+  assert.equal((await listDocuments(storage, 'grande-cdn', 'items')).length, 13);
+});
+
+test('MCP: read_file hands out the version update_page compares against, even for a compressed page', async (t) => {
+  t.after(() => closeMcpHandlerForTesting());
+  const storage = new CompressingCdnStorage();
+  setStorageForTesting(storage);
+  toolCallLimiter.reset();
+  const client = await connect(await signAccessToken({ client_id: 'dcr.test', sub: 'owner', scope: ALL_SCOPES }));
+  const big = `<p>${'contenido '.repeat(300)}</p>`;
+  await client.callTool({ name: 'publish_page', arguments: { prefix: 'pagina-grande', title: 'Grande', html: big } });
+  const read = await client.callTool({ name: 'read_file', arguments: { path: 'pagina-grande' } });
+  const version = read.content[0].text.match(/^version: (.*)$/m)[1];
+  const updated = await client.callTool({ name: 'update_page', arguments: { prefix: 'pagina-grande', html: big + '<p>2</p>', version } });
+  assert.equal(updated.isError, undefined, JSON.stringify(updated).slice(0, 300));
+  await client.close();
+});
+
+test('a burst of simultaneous writes from one page all land', async () => {
+  const storage = new CompressingCdnStorage();
+  setStorageForTesting(storage);
+  await publishPage(storage, 'rafaga');
+  for (let i = 0; i < 10; i++) await writeDocument(storage, 'rafaga', 'items', 'set', `i${i}`, { name: `cosa ${i}`, nota: 'x'.repeat(60) });
+  // What "Quitar lo comprado" does: every removal at once.
+  const results = await Promise.all(Array.from({ length: 10 }, (_, i) => deleteDocument(storage, 'rafaga', 'items', `i${i}`)));
+  assert.deepEqual(results, Array.from({ length: 10 }, () => ({ deleted: true })));
+  assert.deepEqual(await listCollections(storage, 'rafaga'), []);
+});
